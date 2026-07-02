@@ -8,32 +8,45 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import os
+import io
 
 # --- Page Config ---
 st.set_page_config(page_title="Upstox Trade Analyzer", page_icon="📈", layout="wide")
 st.title("📈 Upstox Swing Trade Analyzer")
-st.markdown("Analyze Stop Loss and Target hits using multi-day 1-minute historical & intraday data.")
+st.markdown("Consolidate your multi-day trades into a single Master Ledger.")
+
+# --- Session State for Master Ledger ---
+if "master_ledger" not in st.session_state:
+    st.session_state.master_ledger = pd.DataFrame()
 
 # --- Sidebar: Configuration ---
 with st.sidebar:
     st.header("🔑 API & Alerts Setup")
-    
-    # Upstox API
     default_token = st.secrets.get("UPSTOX_TOKEN", "")
     api_token = st.text_input("Enter Upstox Analytics Token", value=default_token, type="password")
     
     st.markdown("---")
-    # Email Alerts Configuration
     st.subheader("📧 Email Alerts")
     enable_emails = st.checkbox("Enable Exit Alerts", value=True)
     alert_email = st.text_input("Alert Email Address", value="9035490861r@gmail.com")
-    # Using the provided app password as default
     email_pass = st.text_input("Gmail App Password", value="oeci llhn noig moew", type="password")
     
     st.markdown("---")
     st.markdown("**Trade Parameters**")
     sl_pct = st.number_input("Stop Loss %", value=2.0, step=0.5)
     tgt_pct = st.number_input("Target %", value=5.0, step=0.5)
+    
+    st.markdown("---")
+    st.subheader("📂 Load Previous Ledger")
+    st.markdown("Upload your previously downloaded Master Ledger to continue where you left off.")
+    ledger_upload = st.file_uploader("Upload Master Ledger (CSV)", type=["csv"])
+    if ledger_upload is not None:
+        try:
+            st.session_state.master_ledger = pd.read_csv(ledger_upload)
+            st.success("Ledger loaded successfully!")
+        except Exception as e:
+            st.error(f"Error loading ledger: {e}")
+            
     st.markdown("---")
     debug_mode = st.checkbox("🐞 Enable Debug Mode", value=False)
 
@@ -45,7 +58,6 @@ def log_debug(message):
 # --- Load Liquid Stocks List ---
 @st.cache_data(show_spinner=False)
 def load_liquid_stocks():
-    """Loads the liquid stocks list from the local CSV if it exists."""
     liquid_file = 'fno_with_sectors - liquid.csv'
     if os.path.exists(liquid_file):
         try:
@@ -58,34 +70,17 @@ def load_liquid_stocks():
 
 liquid_symbols = load_liquid_stocks()
 
-# --- Email Alert Engine ---
+# --- Helpers: Email, API, Calculation ---
 def send_exit_alert(exited_trades_df, recipient, sender, password):
-    """Sends an HTML email summary of trades that exited today."""
     if exited_trades_df.empty: return False
-    
     subject = f"🚨 Trade Exit Alert: {len(exited_trades_df)} Positions Closed"
-    
-    # Create HTML table for the email
     html_table = exited_trades_df[['Stock Name', 'Category', 'Status', 'Entry Price', 'Exit Price', 'PnL %']].to_html(index=False, border=1)
-    
-    body = f"""
-    <html>
-      <body>
-        <h2>Trade Exit Alerts</h2>
-        <p>The following live trades have met their exit criteria (SL or Target) today:</p>
-        {html_table}
-        <br>
-        <p><i>Automated via Streamlit Swing Trade Analyzer</i></p>
-      </body>
-    </html>
-    """
-    
+    body = f"<html><body><h2>Trade Exit Alerts</h2><p>The following live trades have met their exit criteria (SL or Target) today:</p>{html_table}<br><p><i>Automated via Streamlit Swing Trade Analyzer</i></p></body></html>"
     msg = MIMEMultipart()
     msg['From'] = sender
     msg['To'] = recipient
     msg['Subject'] = subject
     msg.attach(MIMEText(body, 'html'))
-    
     try:
         server = smtplib.SMTP_SSL('smtp.gmail.com', 465)
         server.login(sender, password)
@@ -97,24 +92,15 @@ def send_exit_alert(exited_trades_df, recipient, sender, password):
         return False
 
 def check_and_send_alerts(final_df):
-    """Filters for trades that exited TODAY and triggers the email."""
     if not enable_emails or final_df.empty: return
-    
     today_str = datetime.today().strftime('%Y-%m-%d')
-    # Look for trades that are NOT live and exited today
-    exits_today = final_df[
-        (final_df['Status'].isin(["SL Hit", "Target Hit"])) & 
-        (final_df['Exit Time'].astype(str).str.contains(today_str, na=False))
-    ]
-    
+    exits_today = final_df[(final_df['Status'].isin(["SL Hit", "Target Hit"])) & (final_df['Exit Time'].astype(str).str.contains(today_str, na=False))]
     if not exits_today.empty:
-        success = send_exit_alert(exits_today, alert_email, alert_email, email_pass)
-        if success:
+        if send_exit_alert(exits_today, alert_email, alert_email, email_pass):
             st.toast("✅ Email alert sent for closed trades!")
         else:
             st.toast("⚠️ Failed to send email alert. Check debug logs.", icon="⚠️")
 
-# --- Robust API Handler ---
 def robust_api_get(url, headers, max_retries=4):
     for attempt in range(max_retries):
         res = requests.get(url, headers=headers)
@@ -123,7 +109,6 @@ def robust_api_get(url, headers, max_retries=4):
         else: time.sleep(1)
     return res 
 
-# --- API Helper Functions ---
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_instrument_key(symbol, token):
     if not token: return None
@@ -131,7 +116,6 @@ def get_instrument_key(symbol, token):
     query = urllib.parse.quote(symbol_clean)
     url = f"https://api.upstox.com/v2/instruments/search?query={query}&exchanges=NSE&segments=EQ"
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
-    
     res = robust_api_get(url, headers)
     if res.status_code == 200:
         data = res.json()
@@ -175,30 +159,23 @@ def fetch_all_candles(instrument_key, from_date_str, token):
 def calculate_trade(symbol, trade_date, entry_time, token, sl_p, tgt_p):
     symbol_clean = str(symbol).strip().upper()
     category = "Liquid" if symbol_clean in liquid_symbols else "Others"
-    
     instrument_key = get_instrument_key(symbol_clean, token)
-    if not instrument_key: 
-        return {"Category": category, "Instrument Key": None, "Status": "Error: Symbol Not Found"}
-
+    if not instrument_key: return {"Category": category, "Instrument Key": None, "Status": "Error: Symbol Not Found"}
     try:
         from_date_str = pd.to_datetime(trade_date).strftime("%Y-%m-%d")
-    except Exception:
-        return {"Category": category, "Instrument Key": instrument_key, "Status": "Error: Invalid Date"}
+    except Exception: return {"Category": category, "Instrument Key": instrument_key, "Status": "Error: Invalid Date"}
 
     candles, hist_status = fetch_all_candles(instrument_key, from_date_str, token)
-    if not candles:
-        return {"Category": category, "Instrument Key": instrument_key, "Status": "Error: No Market Data"}
+    if not candles: return {"Category": category, "Instrument Key": instrument_key, "Status": "Error: No Market Data"}
 
     e_time_match = str(entry_time)[:5]
     entry_price, entry_idx = None, -1
-    
     for i, c in enumerate(candles):
         if c[0].split('T')[0] == from_date_str and c[0].split('T')[1][:5] == e_time_match:
             entry_price, entry_idx = c[1], i
             break
 
-    if entry_price is None: 
-        return {"Category": category, "Instrument Key": instrument_key, "Status": f"Error: Time missing"}
+    if entry_price is None: return {"Category": category, "Instrument Key": instrument_key, "Status": f"Error: Time missing"}
 
     sl_price = entry_price * (1 - (sl_p / 100))
     tgt_price = entry_price * (1 + (tgt_p / 100))
@@ -208,7 +185,6 @@ def calculate_trade(symbol, trade_date, entry_time, token, sl_p, tgt_p):
         bars_in_trade += 1
         c = candles[i]
         c_close, c_time_curr = c[4], c[0].split('+')[0]
-        
         if c_close <= sl_price:
             exit_price, exit_time, status = c_close, c_time_curr, "SL Hit"
             break
@@ -223,43 +199,31 @@ def calculate_trade(symbol, trade_date, entry_time, token, sl_p, tgt_p):
     pnl_pct = (pnl / entry_price) * 100
 
     return {
-        "Category": category,
-        "Instrument Key": instrument_key,
-        "Entry Price": round(entry_price, 2),
-        "Exit Price": round(exit_price, 2),
-        "Exit Time": exit_time,
-        "Bars in Trade": bars_in_trade,
-        "Status": status,
-        "PnL (1 qty)": round(pnl, 2),
-        "PnL %": round(pnl_pct, 2)
+        "Category": category, "Instrument Key": instrument_key, "Entry Price": round(entry_price, 2),
+        "Exit Price": round(exit_price, 2), "Exit Time": exit_time, "Bars in Trade": bars_in_trade,
+        "Status": status, "PnL (1 qty)": round(pnl, 2), "PnL %": round(pnl_pct, 2)
     }
 
 def parse_uploaded_csv(df):
-    """Automatically formats known export files into the required schema."""
     if 'seg_sym' in df.columns and 'time' in df.columns:
         df['Stock Name'] = df['seg_sym'].str.replace('NSE:', '', regex=False)
         df['Date'] = pd.to_datetime(df['time']).dt.strftime('%Y-%m-%d')
         df['Entry Time'] = pd.to_datetime(df['time']).dt.strftime('%H:%M')
-        if 'Strategy Name' not in df.columns:
-            df['Strategy Name'] = "Bulk Export"
+        if 'Strategy Name' not in df.columns: df['Strategy Name'] = "Bulk Export"
     return df
 
 def generate_summary(df, group_column):
     stats = []
     if group_column not in df.columns or 'Status' not in df.columns: return pd.DataFrame()
     valid_df = df[~df['Status'].astype(str).str.contains("Error", na=False)]
-    
     for name, group in valid_df.groupby(group_column):
-        group = group.sort_values("Date")
         wins = len(group[group["Status"] == "Target Hit"])
         losses = len(group[group["Status"] == "SL Hit"])
         live = len(group[group["Status"] == "Live"])
         completed = wins + losses
         winrate = (wins / completed * 100) if completed > 0 else 0
-        
         avg_bars_1m = group["Bars in Trade"].mean()
         avg_bars_1h = avg_bars_1m / 60 if pd.notna(avg_bars_1m) else 0
-        
         booked_pnl = group.loc[group["Status"] != "Live", "PnL (1 qty)"].sum()
         mtm_pnl = group.loc[group["Status"] == "Live", "PnL (1 qty)"].sum()
         tot_pnl = group["PnL (1 qty)"].sum()
@@ -271,65 +235,53 @@ def generate_summary(df, group_column):
                 if cum_pnl > peak: peak = cum_pnl
                 dd = peak - cum_pnl
                 if dd > max_dd: max_dd = dd
-                
         max_entry = group["Entry Price"].max()
         max_dd_pct = (max_dd / max_entry * 100) if pd.notna(max_entry) and max_entry > 0 else 0
-        
         stats.append({
-            group_column: name,
-            "Total Trades": len(group),
-            "Wins": wins, "Losses": losses, "Live Trades": live,
+            group_column: name, "Total Trades": len(group), "Wins": wins, "Losses": losses, "Live Trades": live,
             "Win Rate %": round(winrate, 1), "Avg 1H Bars": round(avg_bars_1h, 1),
             "Booked PnL": round(booked_pnl, 2), "MTM PnL": round(mtm_pnl, 2),
             "Total PnL": round(tot_pnl, 2), "Max DD Amount": round(max_dd, 2), "Max DD %": round(max_dd_pct, 2)
         })
     return pd.DataFrame(stats)
 
-# --- Main App ---
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Table Input", "📝 Single Trade", "📁 Bulk CSV", "📈 Summary Stats"])
-
-if "final_results" not in st.session_state:
-    st.session_state.final_results = pd.DataFrame()
+def append_to_ledger(new_df):
+    """Appends new trades to the master ledger and drops duplicates."""
+    if st.session_state.master_ledger.empty:
+        st.session_state.master_ledger = new_df
+    else:
+        st.session_state.master_ledger = pd.concat([st.session_state.master_ledger, new_df], ignore_index=True)
+        # Prevent double-counting the exact same trade entry
+        st.session_state.master_ledger.drop_duplicates(subset=['Stock Name', 'Date', 'Entry Time'], keep='last', inplace=True)
 
 def display_debug_logs():
     if debug_mode and st.session_state.debug_logs:
         with st.expander("🛠️ Debug Logs (Click to expand)", expanded=True):
             for log in st.session_state.debug_logs: st.text(log)
 
-# Tab 1: Interactive Table
+# --- Main App ---
+tab1, tab2, tab3, tab4 = st.tabs(["📚 Master Ledger", "📝 Add Single Trade", "📁 Add Bulk CSV", "📈 Summary Stats"])
+
+# Tab 1: Master Ledger
 with tab1:
-    st.subheader("Build Your Trade List")
-    if "df_template" not in st.session_state:
-        st.session_state.df_template = pd.DataFrame({"Strategy Name": ["Breakout"], "Stock Name": ["RELIANCE"], "Date": [datetime.today().strftime('%Y-%m-%d')], "Entry Time": ["09:15"]})
+    st.subheader("Your Consolidated Master Ledger")
+    if st.session_state.master_ledger.empty:
+        st.info("Your ledger is currently empty. Add trades using the Single Trade or Bulk CSV tabs.")
+    else:
+        st.dataframe(st.session_state.master_ledger, use_container_width=True)
+        
+        # Download Buttons
+        col1, col2 = st.columns(2)
+        csv_data = st.session_state.master_ledger.to_csv(index=False).encode('utf-8')
+        col1.download_button("📥 Download Master Ledger (CSV)", data=csv_data, file_name="Master_Ledger.csv", mime="text/csv", type="primary")
 
-    edited_df = st.data_editor(st.session_state.df_template, num_rows="dynamic", use_container_width=True, hide_index=True)
-
-    if st.button("Process Table Data", type="primary", key="btn_table"):
-        st.session_state.debug_logs = []
-        if not api_token: st.warning("Please enter your API Token.")
-        elif edited_df.empty: st.warning("Please add at least one row.")
-        else:
-            results_list = []
-            progress_bar = st.progress(0)
-            st.cache_data.clear() 
-            
-            for i, row in edited_df.iterrows():
-                time.sleep(0.5) 
-                res = calculate_trade(row.get('Stock Name', ''), row.get('Date', ''), row.get('Entry Time', ''), api_token, sl_pct, tgt_pct)
-                combined = row.to_dict()
-                combined.update(res)
-                results_list.append(combined)
-                progress_bar.progress((i + 1) / len(edited_df))
-                
-            st.session_state.final_results = pd.DataFrame(results_list)
-            st.success("Calculations Complete!")
-            st.dataframe(st.session_state.final_results, use_container_width=True)
-            check_and_send_alerts(st.session_state.final_results)
-            display_debug_logs()
+        if col2.button("Clear Ledger (Start Fresh)"):
+            st.session_state.master_ledger = pd.DataFrame()
+            st.rerun()
 
 # Tab 2: Single Trade
 with tab2:
-    st.subheader("Evaluate a Single Trade")
+    st.subheader("Evaluate & Add a Single Trade")
     col1, col2, col3, col4, col5 = st.columns(5)
     with col1: s_strategy = st.text_input("Strategy Name", value="Breakout")
     with col2: s_symbol = st.text_input("NSE Stock Name", value="RELIANCE")
@@ -337,58 +289,68 @@ with tab2:
     with col4: s_time = st.time_input("Entry Time", value=pd.to_datetime("09:15").time())
     with col5:
         st.markdown("<br>", unsafe_allow_html=True)
-        calc_btn = st.button("Calculate Single", type="primary", use_container_width=True)
+        calc_btn = st.button("Calculate & Add to Ledger", type="primary", use_container_width=True)
 
     if calc_btn:
         st.session_state.debug_logs = []
         if not api_token: st.warning("Please enter your API Token.")
         else:
             with st.spinner("Calculating..."):
-                result = {"Strategy Name": s_strategy, "Stock Name": s_symbol, "Date": s_date, "Entry Time": str(s_time)}
+                result = {"Strategy Name": s_strategy, "Stock Name": s_symbol, "Date": s_date, "Entry Time": str(s_time)[:5]}
                 result.update(calculate_trade(s_symbol, s_date, s_time, api_token, sl_pct, tgt_pct))
                 single_df = pd.DataFrame([result])
                 st.write(result)
+                append_to_ledger(single_df)
                 check_and_send_alerts(single_df)
+                st.success("Trade calculated and added to Master Ledger!")
             display_debug_logs()
 
-# Tab 3: CSV Upload
+# Tab 3: CSV Upload (Multiple Files Supported)
 with tab3:
-    st.subheader("Process Multiple Trades via CSV")
-    uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
-    if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file)
-        df = parse_uploaded_csv(df) # Automatically handle the streak export format
+    st.subheader("Process & Add Multiple Trades via CSV(s)")
+    # accept_multiple_files is now enabled!
+    uploaded_files = st.file_uploader("Upload Bulk Export CSV(s)", type=["csv"], accept_multiple_files=True)
+    
+    if uploaded_files:
+        all_dfs = []
+        for file in uploaded_files:
+            temp_df = pd.read_csv(file)
+            all_dfs.append(temp_df)
+            
+        combined_df = pd.concat(all_dfs, ignore_index=True)
+        combined_df = parse_uploaded_csv(combined_df)
         
-        st.write("Preview of parsed data:", df.head(3))
+        st.write(f"Preview of parsed data ({len(combined_df)} total rows from {len(uploaded_files)} files):", combined_df.head(3))
         
-        if st.button("Process Uploaded CSV", type="primary"):
+        if st.button("Process & Add to Ledger", type="primary"):
             st.session_state.debug_logs = []
             if not api_token: st.warning("Please enter your API Token.")
             else:
                 results_list = []
                 progress_bar = st.progress(0)
                 st.cache_data.clear() 
-                for i, row in df.iterrows():
+                for i, row in combined_df.iterrows():
                     time.sleep(0.5)
                     res = calculate_trade(row.get('Stock Name', row.get('stock name', '')), row.get('Date', row.get('date', '')), row.get('Entry Time', row.get('entry time', '')), api_token, sl_pct, tgt_pct)
                     combined = row.to_dict()
                     combined.update(res)
                     results_list.append(combined)
-                    progress_bar.progress((i + 1) / len(df))
+                    progress_bar.progress((i + 1) / len(combined_df))
                 
-                st.session_state.final_results = pd.DataFrame(results_list)
-                st.success("Calculations Complete!")
-                st.dataframe(st.session_state.final_results)
-                check_and_send_alerts(st.session_state.final_results)
+                new_batch_df = pd.DataFrame(results_list)
+                append_to_ledger(new_batch_df)
+                st.success(f"Bulk calculations complete for {len(uploaded_files)} file(s) and added to Master Ledger!")
+                st.dataframe(new_batch_df)
+                check_and_send_alerts(new_batch_df)
                 display_debug_logs()
 
 # Tab 4: Summary Stats
 with tab4:
     st.subheader("Portfolio Performance Summary")
-    if st.session_state.final_results.empty:
-        st.info("Process some trades in the Table or CSV tabs first to generate a summary.")
+    if st.session_state.master_ledger.empty:
+        st.info("Your Master Ledger is empty.")
     else:
-        valid_res = st.session_state.final_results[~st.session_state.final_results['Status'].astype(str).str.contains("Error", na=False)]
+        valid_res = st.session_state.master_ledger[~st.session_state.master_ledger['Status'].astype(str).str.contains("Error", na=False)]
         
         if not valid_res.empty:
             total_booked_pnl = valid_res.loc[valid_res["Status"] != "Live", "PnL (1 qty)"].sum()
