@@ -1,4 +1,3 @@
-%%writefile streak_scanner_data.py
 import streamlit as st
 import pandas as pd
 import requests
