@@ -8,11 +8,12 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import os
+import math
 
 # --- Page Config ---
 st.set_page_config(page_title="Upstox Trade Analyzer", page_icon="📈", layout="wide")
 st.title("📈 Upstox Swing Trade Analyzer")
-st.markdown("Consolidate your multi-day trades into a single Master Ledger.")
+st.markdown("Consolidate your multi-day trades and compare Equity vs Option PnL.")
 
 # --- Initialization of Session States ---
 if "master_ledger" not in st.session_state:
@@ -40,6 +41,10 @@ with st.sidebar:
     st.markdown("**Trade Parameters**")
     sl_pct = st.number_input("Stop Loss %", value=2.0, step=0.5)
     tgt_pct = st.number_input("Target %", value=5.0, step=0.5)
+    
+    st.markdown("---")
+    st.subheader("🔥 Options Analysis")
+    enable_options = st.checkbox("Fetch ATM Options (Live Contracts Only)", value=True, help="Attempts to find the current month ATM CE contract and calculates exact Option PnL based on Equity exit times.")
     
     st.markdown("---")
     st.subheader("📂 Load Previous Ledger")
@@ -73,7 +78,7 @@ def load_liquid_stocks():
 
 liquid_symbols = load_liquid_stocks()
 
-# --- Helpers: Email, API, Calculation ---
+# --- Helpers: Email & API ---
 def send_exit_alert(exited_trades_df, recipient, sender, password):
     if exited_trades_df.empty: return False
     subject = f"🚨 Trade Exit Alert: {len(exited_trades_df)} Positions Closed"
@@ -113,19 +118,33 @@ def robust_api_get(url, headers, max_retries=4):
     return res 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_instrument_key(symbol, token):
+def get_instrument_key(symbol, token, segment="EQ", strike=None):
     if not token: return None
     symbol_clean = str(symbol).strip().upper()
-    query = urllib.parse.quote(symbol_clean)
-    url = f"https://api.upstox.com/v2/instruments/search?query={query}&exchanges=NSE&segments=EQ"
+    
+    # Custom search query for Options
+    if segment == "OPT" and strike:
+        query = urllib.parse.quote(f"{symbol_clean} {strike} CE")
+        url = f"https://api.upstox.com/v2/instruments/search?query={query}&exchanges=NFO&segments=OPT"
+    else:
+        query = urllib.parse.quote(symbol_clean)
+        url = f"https://api.upstox.com/v2/instruments/search?query={query}&exchanges=NSE&segments=EQ"
+        
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
     res = robust_api_get(url, headers)
+    
     if res.status_code == 200:
         data = res.json()
         if 'data' in data and len(data['data']) > 0:
-            for inst in data['data']:
-                if inst.get('trading_symbol', '').upper() == symbol_clean:
-                    return inst['instrument_key']
+            if segment == "OPT":
+                # For options, just return the first matching active CE instrument
+                for inst in data['data']:
+                    if "CE" in inst.get('trading_symbol', '').upper():
+                        return inst['instrument_key']
+            else:
+                for inst in data['data']:
+                    if inst.get('trading_symbol', '').upper() == symbol_clean:
+                        return inst['instrument_key']
             return data['data'][0]['instrument_key']
     return None
 
@@ -159,17 +178,42 @@ def fetch_all_candles(instrument_key, from_date_str, token):
     all_candles.sort(key=lambda x: x[0])
     return all_candles, hist_res.status_code
 
+def estimate_atm_strike(price):
+    """Estimates the nearest strike price based on typical NSE step sizes."""
+    if price < 200: step = 2.5
+    elif price < 1000: step = 5
+    elif price < 3000: step = 10
+    elif price < 10000: step = 50
+    else: step = 100
+    return round(price / step) * step
+
 def calculate_trade(symbol, trade_date, entry_time, token, sl_p, tgt_p):
     symbol_clean = str(symbol).strip().upper()
     category = "Liquid" if symbol_clean in liquid_symbols else "Others"
-    instrument_key = get_instrument_key(symbol_clean, token)
-    if not instrument_key: return {"Category": category, "Instrument Key": None, "Status": "Error: Symbol Not Found"}
+    instrument_key = get_instrument_key(symbol_clean, token, "EQ")
+    
+    # Setup baseline return dictionary
+    result = {
+        "Category": category, "Instrument Key": instrument_key, "Entry Price": None,
+        "Exit Price": None, "Exit Time": None, "Bars in Trade": 0, "Status": "Pending", 
+        "PnL (1 qty)": None, "PnL %": None, "Opt Key": None, "Opt Entry": None, "Opt Exit": None, "Opt PnL": None
+    }
+    
+    if not instrument_key: 
+        result["Status"] = "Error: Symbol Not Found"
+        return result
+
     try:
         from_date_str = pd.to_datetime(trade_date).strftime("%Y-%m-%d")
-    except Exception: return {"Category": category, "Instrument Key": instrument_key, "Status": "Error: Invalid Date"}
+    except Exception: 
+        result["Status"] = "Error: Invalid Date"
+        return result
 
-    candles, hist_status = fetch_all_candles(instrument_key, from_date_str, token)
-    if not candles: return {"Category": category, "Instrument Key": instrument_key, "Status": "Error: No Market Data"}
+    # 1. Equity Calculations
+    candles, _ = fetch_all_candles(instrument_key, from_date_str, token)
+    if not candles: 
+        result["Status"] = "Error: No Market Data"
+        return result
 
     e_time_match = str(entry_time)[:5]
     entry_price, entry_idx = None, -1
@@ -178,7 +222,9 @@ def calculate_trade(symbol, trade_date, entry_time, token, sl_p, tgt_p):
             entry_price, entry_idx = c[1], i
             break
 
-    if entry_price is None: return {"Category": category, "Instrument Key": instrument_key, "Status": f"Error: Time missing"}
+    if entry_price is None: 
+        result["Status"] = f"Error: Time missing"
+        return result
 
     sl_price = entry_price * (1 - (sl_p / 100))
     tgt_price = entry_price * (1 + (tgt_p / 100))
@@ -198,24 +244,61 @@ def calculate_trade(symbol, trade_date, entry_time, token, sl_p, tgt_p):
     if exit_price is None:
         exit_price, exit_time = candles[-1][4], candles[-1][0].split('+')[0]
 
-    pnl = exit_price - entry_price
-    pnl_pct = (pnl / entry_price) * 100
+    result["Entry Price"] = round(entry_price, 2)
+    result["Exit Price"] = round(exit_price, 2)
+    result["Exit Time"] = exit_time
+    result["Bars in Trade"] = bars_in_trade
+    result["Status"] = status
+    result["PnL (1 qty)"] = round(exit_price - entry_price, 2)
+    result["PnL %"] = round(((exit_price - entry_price) / entry_price) * 100, 2)
 
-    return {
-        "Category": category, "Instrument Key": instrument_key, "Entry Price": round(entry_price, 2),
-        "Exit Price": round(exit_price, 2), "Exit Time": exit_time, "Bars in Trade": bars_in_trade,
-        "Status": status, "PnL (1 qty)": round(pnl, 2), "PnL %": round(pnl_pct, 2)
-    }
+    # 2. Options Calculations (If Enabled)
+    if enable_options:
+        est_strike = estimate_atm_strike(entry_price)
+        opt_key = get_instrument_key(symbol_clean, token, segment="OPT", strike=est_strike)
+        
+        if opt_key:
+            opt_candles, _ = fetch_all_candles(opt_key, from_date_str, token)
+            if opt_candles:
+                opt_entry, opt_exit = None, None
+                
+                # Find matching entry minute in option chart
+                for c in opt_candles:
+                    if c[0].split('T')[0] == from_date_str and c[0].split('T')[1][:5] == e_time_match:
+                        opt_entry = c[1] # Open Price
+                        break
+                        
+                # Find matching exit minute in option chart
+                exit_date = exit_time.split('T')[0]
+                exit_hm = exit_time.split('T')[1][:5]
+                for c in opt_candles:
+                    if c[0].split('T')[0] == exit_date and c[0].split('T')[1][:5] == exit_hm:
+                        opt_exit = c[4] # Close Price
+                        break
+                        
+                # If trade is still live, use latest option price
+                if status == "Live" and opt_candles:
+                    opt_exit = opt_candles[-1][4]
+                
+                result["Opt Key"] = opt_key.split('|')[-1] # Clean display name
+                if opt_entry and opt_exit:
+                    result["Opt Entry"] = round(opt_entry, 2)
+                    result["Opt Exit"] = round(opt_exit, 2)
+                    result["Opt PnL"] = round(opt_exit - opt_entry, 2)
+                else:
+                    log_debug(f"Option data found, but timestamps did not align for {symbol_clean}.")
+        else:
+            log_debug(f"Could not find active CE contract for {symbol_clean} at strike {est_strike}.")
+
+    return result
 
 def parse_uploaded_csv(df, default_strategy):
     if 'seg_sym' in df.columns and 'time' in df.columns:
         df['Stock Name'] = df['seg_sym'].str.replace('NSE:', '', regex=False)
         df['Date'] = pd.to_datetime(df['time']).dt.strftime('%Y-%m-%d')
         df['Entry Time'] = pd.to_datetime(df['time']).dt.strftime('%H:%M')
-    
     if 'Strategy Name' not in df.columns or df['Strategy Name'].isnull().all():
         df['Strategy Name'] = default_strategy
-        
     return df
 
 def generate_summary(df, group_column):
@@ -234,6 +317,9 @@ def generate_summary(df, group_column):
         mtm_pnl = group.loc[group["Status"] == "Live", "PnL (1 qty)"].sum()
         tot_pnl = group["PnL (1 qty)"].sum()
         
+        # Options Summary Stats if columns exist
+        opt_pnl = group["Opt PnL"].sum() if "Opt PnL" in group.columns else 0
+        
         cum_pnl, peak, max_dd = 0, 0, 0
         for pnl in group["PnL (1 qty)"]:
             if pd.notna(pnl):
@@ -243,16 +329,18 @@ def generate_summary(df, group_column):
                 if dd > max_dd: max_dd = dd
         max_entry = group["Entry Price"].max()
         max_dd_pct = (max_dd / max_entry * 100) if pd.notna(max_entry) and max_entry > 0 else 0
-        stats.append({
+        
+        stat_dict = {
             group_column: name, "Total Trades": len(group), "Wins": wins, "Losses": losses, "Live Trades": live,
             "Win Rate %": round(winrate, 1), "Avg 1H Bars": round(avg_bars_1h, 1),
-            "Booked PnL": round(booked_pnl, 2), "MTM PnL": round(mtm_pnl, 2),
-            "Total PnL": round(tot_pnl, 2), "Max DD Amount": round(max_dd, 2), "Max DD %": round(max_dd_pct, 2)
-        })
+            "Eq Booked PnL": round(booked_pnl, 2), "Eq MTM PnL": round(mtm_pnl, 2),
+            "Total Eq PnL": round(tot_pnl, 2), "Max DD Amount": round(max_dd, 2), "Max DD %": round(max_dd_pct, 2)
+        }
+        if enable_options: stat_dict["Total Opt PnL"] = round(opt_pnl, 2)
+        stats.append(stat_dict)
     return pd.DataFrame(stats)
 
 def append_to_ledger(new_df):
-    """Safely appends new trades to the master ledger and drops exact duplicates."""
     if st.session_state.master_ledger.empty:
         st.session_state.master_ledger = new_df.copy()
     else:
@@ -271,7 +359,7 @@ tab1, tab2, tab3, tab4 = st.tabs(["📚 Master Ledger", "📝 Add Single Trade",
 # Tab 1: Master Ledger (Interactive)
 with tab1:
     st.subheader("Your Consolidated Master Ledger")
-    st.markdown("💡 **Tip:** You can click directly into the table below to manually rename strategies or delete unwanted rows. Click 'Save Edits' to update the ledger.")
+    st.markdown("💡 **Tip:** Click directly into the table below to manually rename strategies or delete unwanted rows. Click 'Save Edits' to update.")
     
     if st.session_state.master_ledger.empty:
         st.info("Your ledger is currently empty. Add trades using the Single Trade or Bulk CSV tabs.")
@@ -285,15 +373,8 @@ with tab1:
             
         current_time_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         download_filename = f"Master_Ledger_{current_time_str}.csv"
-        
         csv_data = st.session_state.master_ledger.to_csv(index=False).encode('utf-8')
-        col_dl.download_button(
-            "📥 Download Ledger (CSV)", 
-            data=csv_data, 
-            file_name=download_filename, 
-            mime="text/csv", 
-            use_container_width=True
-        )
+        col_dl.download_button("📥 Download Ledger (CSV)", data=csv_data, file_name=download_filename, mime="text/csv", use_container_width=True)
 
         if col_clear.button("🗑️ Clear Ledger", use_container_width=True):
             st.session_state.master_ledger = pd.DataFrame()
@@ -313,10 +394,9 @@ with tab2:
 
     if calc_btn:
         st.session_state.debug_logs = []
-        if not api_token: 
-            st.warning("Please enter your API Token.")
+        if not api_token: st.warning("Please enter your API Token.")
         else:
-            with st.spinner("Calculating..."):
+            with st.spinner("Calculating Equity (and Options if enabled)..."):
                 result = {"Strategy Name": s_strategy, "Stock Name": s_symbol, "Date": s_date, "Entry Time": str(s_time)[:5]}
                 result.update(calculate_trade(s_symbol, s_date, s_time, api_token, sl_pct, tgt_pct))
                 st.session_state.temp_single_trade = pd.DataFrame([result])
@@ -324,9 +404,6 @@ with tab2:
 
     if not st.session_state.temp_single_trade.empty:
         st.markdown("### ✅ Review Calculation")
-        st.markdown("💡 You can edit fields below before committing to the Master Ledger.")
-        
-        # Use data_editor to allow modifications before confirming
         edited_single = st.data_editor(st.session_state.temp_single_trade, use_container_width=True, num_rows="dynamic")
         
         if st.button("Step 2: Confirm & Add to Master Ledger", type="primary"):
@@ -340,7 +417,7 @@ with tab2:
 # Tab 3: CSV Upload (Two-Step Process)
 with tab3:
     st.subheader("Process & Add Multiple Trades via CSV(s)")
-    batch_strategy_name = st.text_input("Assign a Strategy Name for this batch:", value="EMA Batch", help="This strategy name will be applied to all trades processed in this upload.")
+    batch_strategy_name = st.text_input("Assign a Strategy Name for this batch:", value="EMA Batch")
     uploaded_files = st.file_uploader("Upload Bulk Export CSV(s)", type=["csv"], accept_multiple_files=True)
     
     if uploaded_files:
@@ -349,19 +426,16 @@ with tab3:
             try:
                 temp_df = pd.read_csv(file)
                 if not temp_df.empty: all_dfs.append(temp_df)
-                else: st.warning(f"File '{file.name}' is empty and was skipped.")
-            except pd.errors.EmptyDataError: st.warning(f"File '{file.name}' contains no valid data and was skipped.")
+            except pd.errors.EmptyDataError: pass
             except Exception as e: st.error(f"Error reading file '{file.name}': {e}")
             
         if all_dfs:
             combined_df = pd.concat(all_dfs, ignore_index=True)
             combined_df = parse_uploaded_csv(combined_df, batch_strategy_name)
-            st.write(f"Preview of pending data ({len(combined_df)} rows from valid files):", combined_df.head(3))
             
             if st.button("Step 1: Process Batch Calculations"):
                 st.session_state.debug_logs = []
-                if not api_token: 
-                    st.warning("Please enter your API Token.")
+                if not api_token: st.warning("Please enter your API Token.")
                 else:
                     results_list = []
                     progress_bar = st.progress(0)
@@ -379,9 +453,6 @@ with tab3:
 
     if not st.session_state.temp_bulk_trades.empty:
         st.markdown("### ✅ Review Batch Calculations")
-        st.markdown("💡 **Tip:** You can delete duplicate rows or change specific Strategy Names before saving.")
-        
-        # Use data_editor to allow modifications before confirming
         edited_bulk = st.data_editor(st.session_state.temp_bulk_trades, use_container_width=True, num_rows="dynamic")
         
         if st.button("Step 2: Confirm & Add Batch to Master Ledger", type="primary"):
@@ -409,10 +480,15 @@ with tab4:
             winrate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
             
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Total Booked PnL", f"₹{total_booked_pnl:.2f}")
-            c2.metric("Total MTM PnL", f"₹{total_mtm_pnl:.2f}")
+            c1.metric("Total Eq Booked PnL", f"₹{total_booked_pnl:.2f}")
+            c2.metric("Total Eq MTM PnL", f"₹{total_mtm_pnl:.2f}")
             c3.metric("Overall Winrate", f"{winrate:.1f}%")
             c4.metric("Total Trades", total_trades)
+            
+            if enable_options and "Opt PnL" in valid_res.columns:
+                total_opt_pnl = valid_res["Opt PnL"].sum()
+                st.markdown(f"**Total Options PnL (Calculated):** ₹{total_opt_pnl:.2f}")
+                
             st.markdown("---")
             
             st.markdown("### 📊 Liquid vs. Others Category Summary")
