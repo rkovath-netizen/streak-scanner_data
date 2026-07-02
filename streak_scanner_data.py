@@ -204,12 +204,15 @@ def calculate_trade(symbol, trade_date, entry_time, token, sl_p, tgt_p):
         "Status": status, "PnL (1 qty)": round(pnl, 2), "PnL %": round(pnl_pct, 2)
     }
 
-def parse_uploaded_csv(df):
+def parse_uploaded_csv(df, default_strategy):
     if 'seg_sym' in df.columns and 'time' in df.columns:
         df['Stock Name'] = df['seg_sym'].str.replace('NSE:', '', regex=False)
         df['Date'] = pd.to_datetime(df['time']).dt.strftime('%Y-%m-%d')
         df['Entry Time'] = pd.to_datetime(df['time']).dt.strftime('%H:%M')
-        if 'Strategy Name' not in df.columns: df['Strategy Name'] = "Bulk Export"
+    
+    if 'Strategy Name' not in df.columns or df['Strategy Name'].isnull().all():
+        df['Strategy Name'] = default_strategy
+        
     return df
 
 def generate_summary(df, group_column):
@@ -251,7 +254,6 @@ def append_to_ledger(new_df):
         st.session_state.master_ledger = new_df
     else:
         st.session_state.master_ledger = pd.concat([st.session_state.master_ledger, new_df], ignore_index=True)
-        # Prevent double-counting the exact same trade entry
         st.session_state.master_ledger.drop_duplicates(subset=['Stock Name', 'Date', 'Entry Time'], keep='last', inplace=True)
 
 def display_debug_logs():
@@ -262,20 +264,27 @@ def display_debug_logs():
 # --- Main App ---
 tab1, tab2, tab3, tab4 = st.tabs(["📚 Master Ledger", "📝 Add Single Trade", "📁 Add Bulk CSV", "📈 Summary Stats"])
 
-# Tab 1: Master Ledger
+# Tab 1: Master Ledger (Now Editable!)
 with tab1:
     st.subheader("Your Consolidated Master Ledger")
+    st.markdown("💡 **Tip:** You can click directly into the table below to manually rename strategies or delete unwanted rows. Click 'Save Edits' to update the ledger.")
+    
     if st.session_state.master_ledger.empty:
         st.info("Your ledger is currently empty. Add trades using the Single Trade or Bulk CSV tabs.")
     else:
-        st.dataframe(st.session_state.master_ledger, use_container_width=True)
+        # Use data_editor instead of dataframe so it is interactive
+        edited_ledger = st.data_editor(st.session_state.master_ledger, use_container_width=True, num_rows="dynamic")
         
-        # Download Buttons
-        col1, col2 = st.columns(2)
+        col_save, col_dl, col_clear = st.columns([1, 1, 1])
+        
+        if col_save.button("💾 Save Edits", type="primary", use_container_width=True):
+            st.session_state.master_ledger = edited_ledger
+            st.success("Ledger edits saved successfully! Summary stats have been updated.")
+            
         csv_data = st.session_state.master_ledger.to_csv(index=False).encode('utf-8')
-        col1.download_button("📥 Download Master Ledger (CSV)", data=csv_data, file_name="Master_Ledger.csv", mime="text/csv", type="primary")
+        col_dl.download_button("📥 Download Ledger (CSV)", data=csv_data, file_name="Master_Ledger.csv", mime="text/csv", use_container_width=True)
 
-        if col2.button("Clear Ledger (Start Fresh)"):
+        if col_clear.button("🗑️ Clear Ledger", use_container_width=True):
             st.session_state.master_ledger = pd.DataFrame()
             st.rerun()
 
@@ -305,9 +314,13 @@ with tab2:
                 st.success("Trade calculated and added to Master Ledger!")
             display_debug_logs()
 
-# Tab 3: CSV Upload (Multiple Files Supported)
+# Tab 3: CSV Upload 
 with tab3:
     st.subheader("Process & Add Multiple Trades via CSV(s)")
+    
+    # Text box to assign the batch name before uploading
+    batch_strategy_name = st.text_input("Assign a Strategy Name for this batch:", value="EMA Batch", help="This strategy name will be applied to all trades processed in this upload.")
+    
     uploaded_files = st.file_uploader("Upload Bulk Export CSV(s)", type=["csv"], accept_multiple_files=True)
     
     if uploaded_files:
@@ -326,7 +339,8 @@ with tab3:
             
         if all_dfs:
             combined_df = pd.concat(all_dfs, ignore_index=True)
-            combined_df = parse_uploaded_csv(combined_df)
+            # Pass the batch strategy name to the parser
+            combined_df = parse_uploaded_csv(combined_df, batch_strategy_name)
             
             st.write(f"Preview of parsed data ({len(combined_df)} total rows from valid files):", combined_df.head(3))
             
@@ -347,7 +361,7 @@ with tab3:
                     
                     new_batch_df = pd.DataFrame(results_list)
                     append_to_ledger(new_batch_df)
-                    st.success(f"Bulk calculations complete and added to Master Ledger!")
+                    st.success(f"Bulk calculations complete for {len(uploaded_files)} file(s) and added to Master Ledger!")
                     st.dataframe(new_batch_df)
                     check_and_send_alerts(new_batch_df)
                     display_debug_logs()
