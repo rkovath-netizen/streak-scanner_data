@@ -6,13 +6,22 @@ from datetime import datetime
 
 # --- Page Config ---
 st.set_page_config(page_title="Upstox Trade Analyzer", page_icon="📈", layout="wide")
-st.title("📈 Upstox Intraday Trade Analyzer")
-st.markdown("Analyze Stop Loss (2%) and Target (5%) hits using 1-minute historical data.")
+st.title("📈 Upstox Swing Trade Analyzer")
+st.markdown("Analyze Stop Loss and Target hits using multi-day 1-minute historical data.")
 
 # --- Sidebar: API Configuration ---
 with st.sidebar:
     st.header("🔑 API Setup")
-    api_token = st.text_input("Enter Upstox Analytics Token", type="password", help="Your Bearer token for Upstox API v2")
+    
+    # Securely load token from st.secrets if available
+    default_token = st.secrets.get("UPSTOX_TOKEN", "")
+    
+    api_token = st.text_input(
+        "Enter Upstox Analytics Token", 
+        value=default_token,
+        type="password", 
+        help="Will auto-fill if UPSTOX_TOKEN is set in Streamlit Secrets"
+    )
     st.markdown("---")
     st.markdown("**Parameters**")
     sl_pct = st.number_input("Stop Loss %", value=2.0, step=0.5)
@@ -35,20 +44,22 @@ def get_instrument_key(symbol, token):
                     if inst.get('trading_symbol', '').upper() == symbol_clean:
                         return inst['instrument_key']
                 return data['data'][0]['instrument_key']
-    except Exception as e:
+    except Exception:
         pass
     return None
 
-def fetch_1m_candles(instrument_key, date_str, token):
+def fetch_1m_candles_multiday(instrument_key, from_date_str, token):
+    """Fetches 1-minute candles from the entry date up to today."""
     encoded_key = urllib.parse.quote(instrument_key)
-    url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/1minute/{date_str}/{date_str}"
+    to_date_str = datetime.today().strftime('%Y-%m-%d')
+    url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/1minute/{to_date_str}/{from_date_str}"
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
     res = requests.get(url, headers=headers)
     if res.status_code == 200:
         data = res.json()
         if 'data' in data and 'candles' in data['data']:
             candles = data['data']['candles']
-            candles.reverse() 
+            candles.reverse() # Oldest to newest
             return candles
     return []
 
@@ -56,34 +67,40 @@ def calculate_trade(symbol, trade_date, entry_time, token, sl_p, tgt_p):
     instrument_key = get_instrument_key(symbol, token)
     if not instrument_key: return {"Status": "Error: Symbol Not Found"}
 
-    # Handle various date formats from UI/CSV
     try:
-        date_str = pd.to_datetime(trade_date).strftime("%Y-%m-%d")
-    except:
+        from_date_str = pd.to_datetime(trade_date).strftime("%Y-%m-%d")
+    except Exception:
         return {"Status": "Error: Invalid Date Format"}
 
-    candles = fetch_1m_candles(instrument_key, date_str, token)
-    if not candles: return {"Status": "Error: No Candle Data"}
+    candles = fetch_1m_candles_multiday(instrument_key, from_date_str, token)
+    if not candles: return {"Status": "Error: No Data Available"}
 
-    # Extract HH:MM
     e_time_match = str(entry_time)[:5]
-
     entry_price = None
     entry_idx = -1
+    
+    # 1. Find the exact entry minute
     for i, c in enumerate(candles):
-        if c[0].split('T')[1][:5] == e_time_match:
+        # Match YYYY-MM-DD and HH:MM
+        if c[0].split('T')[0] == from_date_str and c[0].split('T')[1][:5] == e_time_match:
             entry_price, entry_idx = c[1], i
             break
 
-    if entry_price is None: return {"Status": f"Error: Time {e_time_match} not found"}
+    if entry_price is None: return {"Status": f"Error: Time {e_time_match} not found on {from_date_str}"}
 
     sl_price = entry_price * (1 - (sl_p / 100))
     tgt_price = entry_price * (1 + (tgt_p / 100))
-    exit_price, exit_time, status = None, None, "Pending"
+    
+    exit_price, exit_time = None, None
+    status = "Live"
+    bars_in_trade = 0
 
+    # 2. Iterate forward across days until SL or Target hit
     for i in range(entry_idx, len(candles)):
+        bars_in_trade += 1
         c = candles[i]
-        c_close, c_time_curr = c[4], c[0].split('T')[1][:8]
+        c_close, c_time_curr = c[4], c[0].split('+')[0] # Clean timezone for display
+        
         if c_close <= sl_price:
             exit_price, exit_time, status = c_close, c_time_curr, "SL Hit"
             break
@@ -91,8 +108,9 @@ def calculate_trade(symbol, trade_date, entry_time, token, sl_p, tgt_p):
             exit_price, exit_time, status = c_close, c_time_curr, "Target Hit"
             break
 
+    # If neither hit, trade is still active; use the last traded price
     if exit_price is None:
-        exit_price, exit_time, status = candles[-1][4], candles[-1][0].split('T')[1][:8], "EOD Exit"
+        exit_price, exit_time = candles[-1][4], candles[-1][0].split('+')[0]
 
     pnl = exit_price - entry_price
     pnl_pct = (pnl / entry_price) * 100
@@ -102,20 +120,67 @@ def calculate_trade(symbol, trade_date, entry_time, token, sl_p, tgt_p):
         "Entry Price": round(entry_price, 2),
         "Exit Price": round(exit_price, 2),
         "Exit Time": exit_time,
+        "Bars in Trade": bars_in_trade,
         "Status": status,
         "PnL (1 qty)": round(pnl, 2),
         "PnL %": round(pnl_pct, 2)
     }
 
-# --- Main App Tabs ---
-tab1, tab2, tab3 = st.tabs(["📊 Interactive Table Input", "📝 Single Trade", "📁 Bulk CSV Upload"])
+def generate_summary(df):
+    """Calculates stock-by-stock metrics from the processed trades."""
+    stats = []
+    # Ensure columns exist
+    if 'Stock Name' not in df.columns or 'Status' not in df.columns:
+        return pd.DataFrame()
+        
+    for stock, group in df.groupby("Stock Name"):
+        group = group.sort_values("Date")
+        wins = len(group[group["Status"] == "Target Hit"])
+        losses = len(group[group["Status"] == "SL Hit"])
+        completed = wins + losses
+        winrate = (wins / completed * 100) if completed > 0 else 0
+        
+        avg_bars = group["Bars in Trade"].mean()
+        tot_pnl = group["PnL (1 qty)"].sum()
+        tot_pnl_pct = group["PnL %"].sum()
+        
+        # Max Drawdown (Peak to Trough on Cumulative PnL)
+        cum_pnl = 0
+        peak = 0
+        max_dd = 0
+        for pnl in group["PnL (1 qty)"]:
+            cum_pnl += pnl
+            if cum_pnl > peak: peak = cum_pnl
+            dd = peak - cum_pnl
+            if dd > max_dd: max_dd = dd
+            
+        max_entry = group["Entry Price"].max()
+        max_dd_pct = (max_dd / max_entry * 100) if max_entry > 0 else 0
+        
+        stats.append({
+            "Stock Name": stock,
+            "Trades": len(group),
+            "Wins": wins,
+            "Losses": losses,
+            "Win Rate %": round(winrate, 1),
+            "Avg Bars": round(avg_bars, 0),
+            "Total PnL": round(tot_pnl, 2),
+            "Total PnL %": round(tot_pnl_pct, 2),
+            "Max DD Amount": round(max_dd, 2),
+            "Max DD %": round(max_dd_pct, 2)
+        })
+    return pd.DataFrame(stats)
 
-# TAB 1: INTERACTIVE DATA EDITOR (Behaves like a live blank CSV)
+# --- Main App Tabs ---
+tab1, tab2, tab3, tab4 = st.tabs(["📊 Table Input", "📝 Single Trade", "📁 Bulk CSV", "📈 Summary Stats"])
+
+# We use session state to hold calculations so they persist when swapping tabs
+if "final_results" not in st.session_state:
+    st.session_state.final_results = pd.DataFrame()
+
+# TAB 1: INTERACTIVE DATA EDITOR
 with tab1:
     st.subheader("Build Your Trade List")
-    st.markdown("Click inside the table below to add, edit, or delete rows. Once ready, click 'Process Table'.")
-    
-    # Initialize an empty dataframe layout
     if "df_template" not in st.session_state:
         st.session_state.df_template = pd.DataFrame({
             "Strategy Name": ["Breakout"],
@@ -124,48 +189,25 @@ with tab1:
             "Entry Time": ["09:15"]
         })
 
-    # The dynamic editor
-    edited_df = st.data_editor(
-        st.session_state.df_template, 
-        num_rows="dynamic", 
-        use_container_width=True,
-        hide_index=True
-    )
+    edited_df = st.data_editor(st.session_state.df_template, num_rows="dynamic", use_container_width=True, hide_index=True)
 
     if st.button("Process Table Data", type="primary"):
-        if not api_token:
-            st.warning("Please enter your API Token in the sidebar first.")
-        elif edited_df.empty:
-            st.warning("Please add at least one row of data.")
+        if not api_token: st.warning("Please enter your API Token in the sidebar.")
+        elif edited_df.empty: st.warning("Please add at least one row.")
         else:
             results_list = []
             progress_bar = st.progress(0)
             
             for i, row in edited_df.iterrows():
-                res = calculate_trade(
-                    row.get('Stock Name', ''), 
-                    row.get('Date', ''), 
-                    row.get('Entry Time', ''), 
-                    api_token, sl_pct, tgt_pct
-                )
-                
-                combined_row = row.to_dict()
-                combined_row.update(res)
-                results_list.append(combined_row)
+                res = calculate_trade(row.get('Stock Name', ''), row.get('Date', ''), row.get('Entry Time', ''), api_token, sl_pct, tgt_pct)
+                combined = row.to_dict()
+                combined.update(res)
+                results_list.append(combined)
                 progress_bar.progress((i + 1) / len(edited_df))
             
-            final_df = pd.DataFrame(results_list)
-            st.success("Calculations Complete!")
-            st.dataframe(final_df, use_container_width=True)
-            
-            # Allow download of the final calculated data
-            csv_data = final_df.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="Download Results as CSV",
-                data=csv_data,
-                file_name="interactive_calculated_trades.csv",
-                mime="text/csv",
-            )
+            st.session_state.final_results = pd.DataFrame(results_list)
+            st.success("Calculations Complete! Check the Summary Stats tab.")
+            st.dataframe(st.session_state.final_results, use_container_width=True)
 
 # TAB 2: SINGLE TRADE
 with tab2:
@@ -180,10 +222,10 @@ with tab2:
         calc_btn = st.button("Calculate Single", type="primary", use_container_width=True)
 
     if calc_btn:
-        if not api_token: st.warning("Please enter your API Token in the sidebar first.")
+        if not api_token: st.warning("Please enter your API Token.")
         else:
             with st.spinner("Calculating..."):
-                result = {"Strategy Name": s_strategy}
+                result = {"Strategy Name": s_strategy, "Stock Name": s_symbol, "Date": s_date}
                 result.update(calculate_trade(s_symbol, s_date, s_time, api_token, sl_pct, tgt_pct))
                 st.write(result)
 
@@ -193,23 +235,40 @@ with tab3:
     uploaded_file = st.file_uploader("Upload CSV", type=["csv"])
     if uploaded_file is not None:
         df = pd.read_csv(uploaded_file)
-        st.dataframe(df.head())
-        
         if st.button("Process Uploaded CSV", type="primary"):
-            if not api_token: st.warning("Please enter your API Token in the sidebar first.")
+            if not api_token: st.warning("Please enter your API Token.")
             else:
                 results_list = []
                 progress_bar = st.progress(0)
                 for i, row in df.iterrows():
-                    res = calculate_trade(
-                        row.get('stock name', ''), row.get('date', ''), 
-                        row.get('entry time', ''), api_token, sl_pct, tgt_pct
-                    )
+                    res = calculate_trade(row.get('Stock Name', row.get('stock name', '')), row.get('Date', row.get('date', '')), row.get('Entry Time', row.get('entry time', '')), api_token, sl_pct, tgt_pct)
                     combined = row.to_dict()
                     combined.update(res)
                     results_list.append(combined)
                     progress_bar.progress((i + 1) / len(df))
                 
-                final_df = pd.DataFrame(results_list)
-                st.dataframe(final_df)
-                st.download_button("Download Updated CSV", data=final_df.to_csv(index=False).encode('utf-8'), file_name="calculated_trades.csv", mime="text/csv")
+                st.session_state.final_results = pd.DataFrame(results_list)
+                st.success("Calculations Complete!")
+                st.dataframe(st.session_state.final_results)
+
+# TAB 4: SUMMARY STATS
+with tab4:
+    st.subheader("Portfolio Performance Summary")
+    if st.session_state.final_results.empty:
+        st.info("Process some trades in the Table or CSV tabs first to generate a summary.")
+    else:
+        summary_df = generate_summary(st.session_state.final_results)
+        
+        # Display high-level metrics
+        total_pnl = summary_df['Total PnL'].sum()
+        total_wins = summary_df['Wins'].sum()
+        total_trades = summary_df['Trades'].sum()
+        overall_winrate = (total_wins / total_trades * 100) if total_trades > 0 else 0
+        
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Overall PnL", f"₹{total_pnl:.2f}")
+        c2.metric("Overall Winrate", f"{overall_winrate:.1f}%")
+        c3.metric("Total Trades Processed", total_trades)
+        
+        st.markdown("---")
+        st.dataframe(summary_df, use_container_width=True)
