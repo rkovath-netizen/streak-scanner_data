@@ -1,1 +1,3 @@
-streak_scanner_data.py
+streamlit
+pandas
+requests
