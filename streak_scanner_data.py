@@ -308,41 +308,51 @@ with tab2:
 # Tab 3: CSV Upload (Multiple Files Supported)
 with tab3:
     st.subheader("Process & Add Multiple Trades via CSV(s)")
-    # accept_multiple_files is now enabled!
     uploaded_files = st.file_uploader("Upload Bulk Export CSV(s)", type=["csv"], accept_multiple_files=True)
     
     if uploaded_files:
         all_dfs = []
         for file in uploaded_files:
-            temp_df = pd.read_csv(file)
-            all_dfs.append(temp_df)
+            try:
+                temp_df = pd.read_csv(file)
+                if not temp_df.empty:
+                    all_dfs.append(temp_df)
+                else:
+                    st.warning(f"File '{file.name}' is empty and was skipped.")
+            except pd.errors.EmptyDataError:
+                st.warning(f"File '{file.name}' contains no valid data and was skipped.")
+            except Exception as e:
+                st.error(f"Error reading file '{file.name}': {e}")
             
-        combined_df = pd.concat(all_dfs, ignore_index=True)
-        combined_df = parse_uploaded_csv(combined_df)
-        
-        st.write(f"Preview of parsed data ({len(combined_df)} total rows from {len(uploaded_files)} files):", combined_df.head(3))
-        
-        if st.button("Process & Add to Ledger", type="primary"):
-            st.session_state.debug_logs = []
-            if not api_token: st.warning("Please enter your API Token.")
-            else:
-                results_list = []
-                progress_bar = st.progress(0)
-                st.cache_data.clear() 
-                for i, row in combined_df.iterrows():
-                    time.sleep(0.5)
-                    res = calculate_trade(row.get('Stock Name', row.get('stock name', '')), row.get('Date', row.get('date', '')), row.get('Entry Time', row.get('entry time', '')), api_token, sl_pct, tgt_pct)
-                    combined = row.to_dict()
-                    combined.update(res)
-                    results_list.append(combined)
-                    progress_bar.progress((i + 1) / len(combined_df))
-                
-                new_batch_df = pd.DataFrame(results_list)
-                append_to_ledger(new_batch_df)
-                st.success(f"Bulk calculations complete for {len(uploaded_files)} file(s) and added to Master Ledger!")
-                st.dataframe(new_batch_df)
-                check_and_send_alerts(new_batch_df)
-                display_debug_logs()
+        if all_dfs:
+            combined_df = pd.concat(all_dfs, ignore_index=True)
+            combined_df = parse_uploaded_csv(combined_df)
+            
+            st.write(f"Preview of parsed data ({len(combined_df)} total rows from valid files):", combined_df.head(3))
+            
+            if st.button("Process & Add to Ledger", type="primary"):
+                st.session_state.debug_logs = []
+                if not api_token: st.warning("Please enter your API Token.")
+                else:
+                    results_list = []
+                    progress_bar = st.progress(0)
+                    st.cache_data.clear() 
+                    for i, row in combined_df.iterrows():
+                        time.sleep(0.5)
+                        res = calculate_trade(row.get('Stock Name', row.get('stock name', '')), row.get('Date', row.get('date', '')), row.get('Entry Time', row.get('entry time', '')), api_token, sl_pct, tgt_pct)
+                        combined = row.to_dict()
+                        combined.update(res)
+                        results_list.append(combined)
+                        progress_bar.progress((i + 1) / len(combined_df))
+                    
+                    new_batch_df = pd.DataFrame(results_list)
+                    append_to_ledger(new_batch_df)
+                    st.success(f"Bulk calculations complete and added to Master Ledger!")
+                    st.dataframe(new_batch_df)
+                    check_and_send_alerts(new_batch_df)
+                    display_debug_logs()
+        else:
+            st.warning("No valid data found in any of the uploaded files.")
 
 # Tab 4: Summary Stats
 with tab4:
