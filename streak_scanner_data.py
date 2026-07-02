@@ -283,8 +283,17 @@ with tab1:
             st.session_state.master_ledger = edited_ledger
             st.success("Ledger edits saved successfully! Summary stats have been updated.")
             
+        current_time_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        download_filename = f"Master_Ledger_{current_time_str}.csv"
+        
         csv_data = st.session_state.master_ledger.to_csv(index=False).encode('utf-8')
-        col_dl.download_button("📥 Download Ledger (CSV)", data=csv_data, file_name="Master_Ledger.csv", mime="text/csv", use_container_width=True)
+        col_dl.download_button(
+            "📥 Download Ledger (CSV)", 
+            data=csv_data, 
+            file_name=download_filename, 
+            mime="text/csv", 
+            use_container_width=True
+        )
 
         if col_clear.button("🗑️ Clear Ledger", use_container_width=True):
             st.session_state.master_ledger = pd.DataFrame()
@@ -302,7 +311,6 @@ with tab2:
         st.markdown("<br>", unsafe_allow_html=True)
         calc_btn = st.button("Step 1: Calculate Trade", use_container_width=True)
 
-    # Step 1: Calculate and Hold in Memory
     if calc_btn:
         st.session_state.debug_logs = []
         if not api_token: 
@@ -314,17 +322,19 @@ with tab2:
                 st.session_state.temp_single_trade = pd.DataFrame([result])
             display_debug_logs()
 
-    # Step 2: Review and Add
     if not st.session_state.temp_single_trade.empty:
         st.markdown("### ✅ Review Calculation")
-        st.dataframe(st.session_state.temp_single_trade, use_container_width=True)
+        st.markdown("💡 You can edit fields below before committing to the Master Ledger.")
+        
+        # Use data_editor to allow modifications before confirming
+        edited_single = st.data_editor(st.session_state.temp_single_trade, use_container_width=True, num_rows="dynamic")
         
         if st.button("Step 2: Confirm & Add to Master Ledger", type="primary"):
-            append_to_ledger(st.session_state.temp_single_trade)
-            check_and_send_alerts(st.session_state.temp_single_trade)
-            st.session_state.temp_single_trade = pd.DataFrame() # Clear memory
+            append_to_ledger(edited_single)
+            check_and_send_alerts(edited_single)
+            st.session_state.temp_single_trade = pd.DataFrame() 
             st.success("Trade successfully added to Master Ledger!")
-            time.sleep(1) # Give user a second to see the success message
+            time.sleep(1) 
             st.rerun()
 
 # Tab 3: CSV Upload (Two-Step Process)
@@ -333,7 +343,6 @@ with tab3:
     batch_strategy_name = st.text_input("Assign a Strategy Name for this batch:", value="EMA Batch", help="This strategy name will be applied to all trades processed in this upload.")
     uploaded_files = st.file_uploader("Upload Bulk Export CSV(s)", type=["csv"], accept_multiple_files=True)
     
-    # Step 1: Process and Hold in Memory
     if uploaded_files:
         all_dfs = []
         for file in uploaded_files:
@@ -368,15 +377,17 @@ with tab3:
                     st.session_state.temp_bulk_trades = pd.DataFrame(results_list)
                     display_debug_logs()
 
-    # Step 2: Review and Add
     if not st.session_state.temp_bulk_trades.empty:
         st.markdown("### ✅ Review Batch Calculations")
-        st.dataframe(st.session_state.temp_bulk_trades, use_container_width=True)
+        st.markdown("💡 **Tip:** You can delete duplicate rows or change specific Strategy Names before saving.")
+        
+        # Use data_editor to allow modifications before confirming
+        edited_bulk = st.data_editor(st.session_state.temp_bulk_trades, use_container_width=True, num_rows="dynamic")
         
         if st.button("Step 2: Confirm & Add Batch to Master Ledger", type="primary"):
-            append_to_ledger(st.session_state.temp_bulk_trades)
-            check_and_send_alerts(st.session_state.temp_bulk_trades)
-            st.session_state.temp_bulk_trades = pd.DataFrame() # Clear memory
+            append_to_ledger(edited_bulk)
+            check_and_send_alerts(edited_bulk)
+            st.session_state.temp_bulk_trades = pd.DataFrame() 
             st.success("Batch successfully added to Master Ledger!")
             time.sleep(1)
             st.rerun()
