@@ -8,16 +8,21 @@ import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 import os
-import io
 
 # --- Page Config ---
 st.set_page_config(page_title="Upstox Trade Analyzer", page_icon="📈", layout="wide")
 st.title("📈 Upstox Swing Trade Analyzer")
 st.markdown("Consolidate your multi-day trades into a single Master Ledger.")
 
-# --- Session State for Master Ledger ---
+# --- Initialization of Session States ---
 if "master_ledger" not in st.session_state:
     st.session_state.master_ledger = pd.DataFrame()
+if "temp_single_trade" not in st.session_state:
+    st.session_state.temp_single_trade = pd.DataFrame()
+if "temp_bulk_trades" not in st.session_state:
+    st.session_state.temp_bulk_trades = pd.DataFrame()
+if "debug_logs" not in st.session_state: 
+    st.session_state.debug_logs = []
 
 # --- Sidebar: Configuration ---
 with st.sidebar:
@@ -50,8 +55,6 @@ with st.sidebar:
     st.markdown("---")
     debug_mode = st.checkbox("🐞 Enable Debug Mode", value=False)
 
-# --- Globals for Debugging ---
-if "debug_logs" not in st.session_state: st.session_state.debug_logs = []
 def log_debug(message):
     if debug_mode: st.session_state.debug_logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
 
@@ -249,12 +252,13 @@ def generate_summary(df, group_column):
     return pd.DataFrame(stats)
 
 def append_to_ledger(new_df):
-    """Appends new trades to the master ledger and drops duplicates."""
+    """Safely appends new trades to the master ledger and drops exact duplicates."""
     if st.session_state.master_ledger.empty:
-        st.session_state.master_ledger = new_df
+        st.session_state.master_ledger = new_df.copy()
     else:
-        st.session_state.master_ledger = pd.concat([st.session_state.master_ledger, new_df], ignore_index=True)
-        st.session_state.master_ledger.drop_duplicates(subset=['Stock Name', 'Date', 'Entry Time'], keep='last', inplace=True)
+        combined = pd.concat([st.session_state.master_ledger, new_df], ignore_index=True)
+        combined.drop_duplicates(subset=['Stock Name', 'Date', 'Entry Time'], keep='last', inplace=True)
+        st.session_state.master_ledger = combined
 
 def display_debug_logs():
     if debug_mode and st.session_state.debug_logs:
@@ -264,7 +268,7 @@ def display_debug_logs():
 # --- Main App ---
 tab1, tab2, tab3, tab4 = st.tabs(["📚 Master Ledger", "📝 Add Single Trade", "📁 Add Bulk CSV", "📈 Summary Stats"])
 
-# Tab 1: Master Ledger (Now Editable!)
+# Tab 1: Master Ledger (Interactive)
 with tab1:
     st.subheader("Your Consolidated Master Ledger")
     st.markdown("💡 **Tip:** You can click directly into the table below to manually rename strategies or delete unwanted rows. Click 'Save Edits' to update the ledger.")
@@ -272,9 +276,7 @@ with tab1:
     if st.session_state.master_ledger.empty:
         st.info("Your ledger is currently empty. Add trades using the Single Trade or Bulk CSV tabs.")
     else:
-        # Use data_editor instead of dataframe so it is interactive
         edited_ledger = st.data_editor(st.session_state.master_ledger, use_container_width=True, num_rows="dynamic")
-        
         col_save, col_dl, col_clear = st.columns([1, 1, 1])
         
         if col_save.button("💾 Save Edits", type="primary", use_container_width=True):
@@ -288,7 +290,7 @@ with tab1:
             st.session_state.master_ledger = pd.DataFrame()
             st.rerun()
 
-# Tab 2: Single Trade
+# Tab 2: Single Trade (Two-Step Process)
 with tab2:
     st.subheader("Evaluate & Add a Single Trade")
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -298,55 +300,59 @@ with tab2:
     with col4: s_time = st.time_input("Entry Time", value=pd.to_datetime("09:15").time())
     with col5:
         st.markdown("<br>", unsafe_allow_html=True)
-        calc_btn = st.button("Calculate & Add to Ledger", type="primary", use_container_width=True)
+        calc_btn = st.button("Step 1: Calculate Trade", use_container_width=True)
 
+    # Step 1: Calculate and Hold in Memory
     if calc_btn:
         st.session_state.debug_logs = []
-        if not api_token: st.warning("Please enter your API Token.")
+        if not api_token: 
+            st.warning("Please enter your API Token.")
         else:
             with st.spinner("Calculating..."):
                 result = {"Strategy Name": s_strategy, "Stock Name": s_symbol, "Date": s_date, "Entry Time": str(s_time)[:5]}
                 result.update(calculate_trade(s_symbol, s_date, s_time, api_token, sl_pct, tgt_pct))
-                single_df = pd.DataFrame([result])
-                st.write(result)
-                append_to_ledger(single_df)
-                check_and_send_alerts(single_df)
-                st.success("Trade calculated and added to Master Ledger!")
+                st.session_state.temp_single_trade = pd.DataFrame([result])
             display_debug_logs()
 
-# Tab 3: CSV Upload 
+    # Step 2: Review and Add
+    if not st.session_state.temp_single_trade.empty:
+        st.markdown("### ✅ Review Calculation")
+        st.dataframe(st.session_state.temp_single_trade, use_container_width=True)
+        
+        if st.button("Step 2: Confirm & Add to Master Ledger", type="primary"):
+            append_to_ledger(st.session_state.temp_single_trade)
+            check_and_send_alerts(st.session_state.temp_single_trade)
+            st.session_state.temp_single_trade = pd.DataFrame() # Clear memory
+            st.success("Trade successfully added to Master Ledger!")
+            time.sleep(1) # Give user a second to see the success message
+            st.rerun()
+
+# Tab 3: CSV Upload (Two-Step Process)
 with tab3:
     st.subheader("Process & Add Multiple Trades via CSV(s)")
-    
-    # Text box to assign the batch name before uploading
     batch_strategy_name = st.text_input("Assign a Strategy Name for this batch:", value="EMA Batch", help="This strategy name will be applied to all trades processed in this upload.")
-    
     uploaded_files = st.file_uploader("Upload Bulk Export CSV(s)", type=["csv"], accept_multiple_files=True)
     
+    # Step 1: Process and Hold in Memory
     if uploaded_files:
         all_dfs = []
         for file in uploaded_files:
             try:
                 temp_df = pd.read_csv(file)
-                if not temp_df.empty:
-                    all_dfs.append(temp_df)
-                else:
-                    st.warning(f"File '{file.name}' is empty and was skipped.")
-            except pd.errors.EmptyDataError:
-                st.warning(f"File '{file.name}' contains no valid data and was skipped.")
-            except Exception as e:
-                st.error(f"Error reading file '{file.name}': {e}")
+                if not temp_df.empty: all_dfs.append(temp_df)
+                else: st.warning(f"File '{file.name}' is empty and was skipped.")
+            except pd.errors.EmptyDataError: st.warning(f"File '{file.name}' contains no valid data and was skipped.")
+            except Exception as e: st.error(f"Error reading file '{file.name}': {e}")
             
         if all_dfs:
             combined_df = pd.concat(all_dfs, ignore_index=True)
-            # Pass the batch strategy name to the parser
             combined_df = parse_uploaded_csv(combined_df, batch_strategy_name)
+            st.write(f"Preview of pending data ({len(combined_df)} rows from valid files):", combined_df.head(3))
             
-            st.write(f"Preview of parsed data ({len(combined_df)} total rows from valid files):", combined_df.head(3))
-            
-            if st.button("Process & Add to Ledger", type="primary"):
+            if st.button("Step 1: Process Batch Calculations"):
                 st.session_state.debug_logs = []
-                if not api_token: st.warning("Please enter your API Token.")
+                if not api_token: 
+                    st.warning("Please enter your API Token.")
                 else:
                     results_list = []
                     progress_bar = st.progress(0)
@@ -359,14 +365,21 @@ with tab3:
                         results_list.append(combined)
                         progress_bar.progress((i + 1) / len(combined_df))
                     
-                    new_batch_df = pd.DataFrame(results_list)
-                    append_to_ledger(new_batch_df)
-                    st.success(f"Bulk calculations complete for {len(uploaded_files)} file(s) and added to Master Ledger!")
-                    st.dataframe(new_batch_df)
-                    check_and_send_alerts(new_batch_df)
+                    st.session_state.temp_bulk_trades = pd.DataFrame(results_list)
                     display_debug_logs()
-        else:
-            st.warning("No valid data found in any of the uploaded files.")
+
+    # Step 2: Review and Add
+    if not st.session_state.temp_bulk_trades.empty:
+        st.markdown("### ✅ Review Batch Calculations")
+        st.dataframe(st.session_state.temp_bulk_trades, use_container_width=True)
+        
+        if st.button("Step 2: Confirm & Add Batch to Master Ledger", type="primary"):
+            append_to_ledger(st.session_state.temp_bulk_trades)
+            check_and_send_alerts(st.session_state.temp_bulk_trades)
+            st.session_state.temp_bulk_trades = pd.DataFrame() # Clear memory
+            st.success("Batch successfully added to Master Ledger!")
+            time.sleep(1)
+            st.rerun()
 
 # Tab 4: Summary Stats
 with tab4:
