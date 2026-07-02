@@ -20,6 +20,21 @@ with st.sidebar:
     sl_pct = st.number_input("Stop Loss %", value=2.0, step=0.5)
     tgt_pct = st.number_input("Target %", value=5.0, step=0.5)
 
+# --- Robust API Handler ---
+def robust_api_get(url, headers, max_retries=4):
+    """Handles API requests with exponential backoff for rate limits (429)."""
+    for attempt in range(max_retries):
+        res = requests.get(url, headers=headers)
+        if res.status_code == 200:
+            return res
+        elif res.status_code == 429:
+            # Exponential backoff: sleeps 1s, 2s, 4s, 8s
+            time.sleep(2 ** attempt) 
+        else:
+            # For other errors (like 502 Bad Gateway), wait 1 second and retry
+            time.sleep(1)
+    return res # Return the last response if all retries fail
+
 # --- API Helper Functions ---
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_instrument_key(symbol, token):
@@ -28,13 +43,9 @@ def get_instrument_key(symbol, token):
     query = urllib.parse.quote(symbol_clean)
     url = f"https://api.upstox.com/v2/instruments/search?query={query}&exchanges=NSE&segments=EQ"
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
+    
     try:
-        res = requests.get(url, headers=headers)
-        # Built-in retry if we hit rate limits
-        if res.status_code == 429: 
-            time.sleep(1.5)
-            res = requests.get(url, headers=headers)
-            
+        res = robust_api_get(url, headers)
         if res.status_code == 200:
             data = res.json()
             if 'data' in data and len(data['data']) > 0:
@@ -52,23 +63,18 @@ def fetch_1m_candles_multiday(instrument_key, from_date_str, token):
     url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/1minute/{to_date_str}/{from_date_str}"
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
     
-    res = requests.get(url, headers=headers)
-    # Built-in retry if we hit rate limits
-    if res.status_code == 429: 
-        time.sleep(1.5)
-        res = requests.get(url, headers=headers)
-        
+    res = robust_api_get(url, headers)
+    
     if res.status_code == 200:
         data = res.json()
-        if 'data' in data and 'candles' in data['data']:
+        if 'data' in data and 'candles' in data['data'] and data['data']['candles']:
             candles = data['data']['candles']
             candles.reverse() 
-            return candles
-    return []
+            return candles, 200
+    return [], res.status_code
 
 def calculate_trade(symbol, trade_date, entry_time, token, sl_p, tgt_p):
     instrument_key = get_instrument_key(symbol, token)
-    # Added instrument key mapping to error dictionary so it doesn't wipe the column visually
     if not instrument_key: return {"Instrument Key": None, "Status": "Error: Symbol Not Found"}
 
     try:
@@ -76,8 +82,13 @@ def calculate_trade(symbol, trade_date, entry_time, token, sl_p, tgt_p):
     except Exception:
         return {"Instrument Key": instrument_key, "Status": "Error: Invalid Date Format"}
 
-    candles = fetch_1m_candles_multiday(instrument_key, from_date_str, token)
-    if not candles: return {"Instrument Key": instrument_key, "Status": "Error: No Data Available"}
+    candles, status_code = fetch_1m_candles_multiday(instrument_key, from_date_str, token)
+    
+    if not candles: 
+        if status_code != 200:
+            return {"Instrument Key": instrument_key, "Status": f"API Error Code: {status_code}"}
+        else:
+            return {"Instrument Key": instrument_key, "Status": "Error: No Market Data"}
 
     e_time_match = str(entry_time)[:5]
     entry_price = None
@@ -130,8 +141,7 @@ def generate_summary(df):
     stats = []
     if 'Stock Name' not in df.columns or 'Status' not in df.columns: return pd.DataFrame()
     
-    # Ignore trades that error'd out from the math calculations
-    valid_df = df[~df['Status'].str.contains("Error", na=False)]
+    valid_df = df[~df['Status'].astype(str).str.contains("Error", na=False)]
     
     for stock, group in valid_df.groupby("Stock Name"):
         group = group.sort_values("Date")
@@ -188,12 +198,11 @@ with tab1:
             results_list = []
             progress_bar = st.progress(0)
             
-            # Clear cache so previously failed symbols get retried
             st.cache_data.clear() 
             
             for i, row in edited_df.iterrows():
-                # CRITICAL: Throttle API calls to avoid 429 Too Many Requests
-                time.sleep(0.25) 
+                # Increased base delay slightly to smooth out batch processing
+                time.sleep(0.5) 
                 res = calculate_trade(row.get('Stock Name', ''), row.get('Date', ''), row.get('Entry Time', ''), api_token, sl_pct, tgt_pct)
                 combined = row.to_dict()
                 combined.update(res)
@@ -235,8 +244,8 @@ with tab3:
                 progress_bar = st.progress(0)
                 st.cache_data.clear() 
                 for i, row in df.iterrows():
-                    # CRITICAL: Throttle API calls to avoid 429 Too Many Requests
-                    time.sleep(0.25)
+                    # Increased base delay slightly
+                    time.sleep(0.5)
                     res = calculate_trade(row.get('Stock Name', row.get('stock name', '')), row.get('Date', row.get('date', '')), row.get('Entry Time', row.get('entry time', '')), api_token, sl_pct, tgt_pct)
                     combined = row.to_dict()
                     combined.update(res)
