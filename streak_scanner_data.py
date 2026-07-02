@@ -64,17 +64,13 @@ def get_instrument_key(symbol, token):
     return None
 
 def fetch_all_candles(instrument_key, from_date_str, token):
-    """Fetches and merges both historical and today's live intraday candles."""
     encoded_key = urllib.parse.quote(instrument_key)
     today_str = datetime.today().strftime('%Y-%m-%d')
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
-    
     all_candles = []
     
-    # 1. Fetch Historical (Past Days)
     hist_url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/1minute/{today_str}/{from_date_str}"
     hist_res = robust_api_get(hist_url, headers)
-    
     if hist_res.status_code == 200:
         data = hist_res.json()
         if 'data' in data and 'candles' in data['data']:
@@ -84,17 +80,13 @@ def fetch_all_candles(instrument_key, from_date_str, token):
     else:
         log_debug(f"Historical API Error for {instrument_key}: Code {hist_res.status_code} - {hist_res.text}")
 
-    # 2. Fetch Intraday (Current Day)
     intra_url = f"https://api.upstox.com/v2/historical-candle/intraday/{encoded_key}/1minute"
     intra_res = robust_api_get(intra_url, headers)
-    
     if intra_res.status_code == 200:
         data = intra_res.json()
         if 'data' in data and 'candles' in data['data']:
             candles = data['data']['candles']
             candles.reverse()
-            
-            # Merge without duplicating overlapping timestamps
             existing_timestamps = {c[0] for c in all_candles}
             for c in candles:
                 if c[0] not in existing_timestamps:
@@ -102,9 +94,7 @@ def fetch_all_candles(instrument_key, from_date_str, token):
     else:
         log_debug(f"Intraday API Error for {instrument_key}: Code {intra_res.status_code} - {intra_res.text}")
 
-    # Sort purely chronologically just in case
     all_candles.sort(key=lambda x: x[0])
-    
     return all_candles, hist_res.status_code
 
 def calculate_trade(symbol, trade_date, entry_time, token, sl_p, tgt_p):
@@ -118,23 +108,20 @@ def calculate_trade(symbol, trade_date, entry_time, token, sl_p, tgt_p):
         return {"Instrument Key": instrument_key, "Status": "Error: Invalid Date"}
 
     candles, hist_status = fetch_all_candles(instrument_key, from_date_str, token)
-    
     if not candles:
-        log_debug(f"[{symbol}] Both Historical and Intraday returned 0 candles for date {from_date_str}.")
+        log_debug(f"[{symbol}] 0 candles for date {from_date_str}.")
         return {"Instrument Key": instrument_key, "Status": "Error: No Market Data"}
 
     e_time_match = str(entry_time)[:5]
     entry_price = None
     entry_idx = -1
-    
     for i, c in enumerate(candles):
-        # Match YYYY-MM-DD and HH:MM
         if c[0].split('T')[0] == from_date_str and c[0].split('T')[1][:5] == e_time_match:
             entry_price, entry_idx = c[1], i
             break
 
     if entry_price is None: 
-        log_debug(f"[{symbol}] Entry time {e_time_match} not found. Available start times: {candles[0][0]} to {candles[-1][0]}")
+        log_debug(f"[{symbol}] Entry time {e_time_match} missing.")
         return {"Instrument Key": instrument_key, "Status": f"Error: Time {e_time_match} missing"}
 
     sl_price = entry_price * (1 - (sl_p / 100))
@@ -172,19 +159,30 @@ def calculate_trade(symbol, trade_date, entry_time, token, sl_p, tgt_p):
         "PnL %": round(pnl_pct, 2)
     }
 
-def generate_summary(df):
+def generate_summary(df, group_column):
     stats = []
-    if 'Stock Name' not in df.columns or 'Status' not in df.columns: return pd.DataFrame()
+    if group_column not in df.columns or 'Status' not in df.columns: return pd.DataFrame()
     valid_df = df[~df['Status'].astype(str).str.contains("Error", na=False)]
-    for stock, group in valid_df.groupby("Stock Name"):
+    
+    for name, group in valid_df.groupby(group_column):
         group = group.sort_values("Date")
         wins = len(group[group["Status"] == "Target Hit"])
         losses = len(group[group["Status"] == "SL Hit"])
+        live = len(group[group["Status"] == "Live"])
         completed = wins + losses
         winrate = (wins / completed * 100) if completed > 0 else 0
-        avg_bars = group["Bars in Trade"].mean()
+        
+        # 1-Hour Bar Conversion
+        avg_bars_1m = group["Bars in Trade"].mean()
+        avg_bars_1h = avg_bars_1m / 60 if pd.notna(avg_bars_1m) else 0
+        
+        # MTM vs Booked PnL
+        booked_mask = group["Status"] != "Live"
+        mtm_mask = group["Status"] == "Live"
+        booked_pnl = group.loc[booked_mask, "PnL (1 qty)"].sum()
+        mtm_pnl = group.loc[mtm_mask, "PnL (1 qty)"].sum()
         tot_pnl = group["PnL (1 qty)"].sum()
-        tot_pnl_pct = group["PnL %"].sum()
+        
         cum_pnl, peak, max_dd = 0, 0, 0
         for pnl in group["PnL (1 qty)"]:
             if pd.notna(pnl):
@@ -192,13 +190,23 @@ def generate_summary(df):
                 if cum_pnl > peak: peak = cum_pnl
                 dd = peak - cum_pnl
                 if dd > max_dd: max_dd = dd
+                
         max_entry = group["Entry Price"].max()
         max_dd_pct = (max_dd / max_entry * 100) if pd.notna(max_entry) and max_entry > 0 else 0
+        
         stats.append({
-            "Stock Name": stock, "Trades": len(group), "Wins": wins, "Losses": losses,
-            "Win Rate %": round(winrate, 1), "Avg Bars": round(avg_bars, 0) if pd.notna(avg_bars) else 0,
-            "Total PnL": round(tot_pnl, 2), "Total PnL %": round(tot_pnl_pct, 2),
-            "Max DD Amount": round(max_dd, 2), "Max DD %": round(max_dd_pct, 2)
+            group_column: name,
+            "Total Trades": len(group),
+            "Wins": wins,
+            "Losses": losses,
+            "Live Trades": live,
+            "Win Rate %": round(winrate, 1),
+            "Avg 1H Bars": round(avg_bars_1h, 1),
+            "Booked PnL": round(booked_pnl, 2),
+            "MTM PnL": round(mtm_pnl, 2),
+            "Total PnL": round(tot_pnl, 2),
+            "Max DD Amount": round(max_dd, 2),
+            "Max DD %": round(max_dd_pct, 2)
         })
     return pd.DataFrame(stats)
 
@@ -294,18 +302,40 @@ with tab4:
     if st.session_state.final_results.empty:
         st.info("Process some trades in the Table or CSV tabs first to generate a summary.")
     else:
-        summary_df = generate_summary(st.session_state.final_results)
-        if not summary_df.empty:
-            total_pnl = summary_df['Total PnL'].sum()
-            total_wins = summary_df['Wins'].sum()
-            total_trades = summary_df['Trades'].sum()
-            overall_winrate = (total_wins / total_trades * 100) if total_trades > 0 else 0
+        # Generate overall portfolio values
+        valid_res = st.session_state.final_results[~st.session_state.final_results['Status'].astype(str).str.contains("Error", na=False)]
+        
+        if not valid_res.empty:
+            total_booked_pnl = valid_res.loc[valid_res["Status"] != "Live", "PnL (1 qty)"].sum()
+            total_mtm_pnl = valid_res.loc[valid_res["Status"] == "Live", "PnL (1 qty)"].sum()
+            total_trades = len(valid_res)
+            wins = len(valid_res[valid_res["Status"] == "Target Hit"])
+            losses = len(valid_res[valid_res["Status"] == "SL Hit"])
+            winrate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
             
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Overall PnL", f"₹{total_pnl:.2f}")
-            c2.metric("Overall Winrate", f"{overall_winrate:.1f}%")
-            c3.metric("Total Trades Processed", total_trades)
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Total Booked PnL", f"₹{total_booked_pnl:.2f}", help="Sum of PnL from closed trades (SL/Target Hits)")
+            c2.metric("Total MTM PnL", f"₹{total_mtm_pnl:.2f}", help="Floating PnL from trades still 'Live'")
+            c3.metric("Overall Winrate", f"{winrate:.1f}%")
+            c4.metric("Total Trades", total_trades)
             st.markdown("---")
-            st.dataframe(summary_df, use_container_width=True)
+            
+            # 1. Strategy Summary
+            st.markdown("### 🏆 Strategy-wise Summary")
+            strategy_col_name = 'Strategy Name' if 'Strategy Name' in st.session_state.final_results.columns else 'strategy name'
+            if strategy_col_name in st.session_state.final_results.columns:
+                strat_summary_df = generate_summary(st.session_state.final_results, strategy_col_name)
+                st.dataframe(strat_summary_df, use_container_width=True)
+            else:
+                st.warning("No 'Strategy Name' column found in your data.")
+                
+            st.markdown("<br>", unsafe_allow_html=True)
+            
+            # 2. Stock Summary
+            st.markdown("### 🏢 Stock-wise Summary")
+            stock_col_name = 'Stock Name' if 'Stock Name' in st.session_state.final_results.columns else 'stock name'
+            stock_summary_df = generate_summary(st.session_state.final_results, stock_col_name)
+            st.dataframe(stock_summary_df, use_container_width=True)
+            
         else:
             st.warning("Could not generate summary. Check if all data processed successfully.")
