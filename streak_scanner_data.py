@@ -66,11 +66,13 @@ with st.sidebar:
     st.subheader("📂 Load Previous Ledger")
     ledger_upload = st.file_uploader("Upload Master Ledger (CSV)", type=["csv"])
     if ledger_upload is not None:
-        try:
-            st.session_state.master_ledger = pd.read_csv(ledger_upload)
-            st.success("Ledger loaded successfully!")
-        except Exception as e:
-            st.error(f"Error loading ledger: {e}")
+        # BUG FIX: Added a button so it doesn't overwrite the master ledger on every single app rerun
+        if st.button("Load Uploaded Ledger"):
+            try:
+                st.session_state.master_ledger = pd.read_csv(ledger_upload)
+                st.success("Ledger loaded successfully!")
+            except Exception as e:
+                st.error(f"Error loading ledger: {e}")
             
     st.markdown("---")
     debug_mode = st.checkbox("🐞 Enable Debug Mode", value=False)
@@ -185,15 +187,13 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, sl_p
     category = "Liquid" if symbol_clean in liquid_symbols else "Others"
     instrument_key = get_instrument_key(symbol_clean, token)
     
-    # Determine if this is a Buy (Long) or Sell (Short) Strategy
     is_short = str(strategy_name).strip().lower().startswith('s_')
     
-    # Smart Time Parsing & Offset
     trigger_time_str = str(trigger_time)[:5]
     try:
         t_dt = pd.to_datetime(f"{trade_date} {trigger_time_str}")
         exec_dt = t_dt + timedelta(minutes=int(tf_minutes))
-        exec_target_str = exec_dt.strftime("%Y-%m-%dT%H:%M") # Format: YYYY-MM-DDTHH:MM
+        exec_target_str = exec_dt.strftime("%Y-%m-%dT%H:%M") 
     except Exception:
         exec_target_str = f"{trade_date}T{trigger_time_str}"
         
@@ -213,12 +213,11 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, sl_p
         result["Status"] = "Error: No Market Data"
         return result
 
-    # Smart Execution Finder: Find the first available candle >= execution target time
     entry_price, entry_idx, actual_exec_time = None, -1, None
     for i, c in enumerate(candles):
-        c_time_str = c[0][:16] # Extract YYYY-MM-DDTHH:MM
+        c_time_str = c[0][:16] 
         if c_time_str >= exec_target_str:
-            entry_price = c[1] # Open price of that candle
+            entry_price = c[1] 
             entry_idx = i
             actual_exec_time = c_time_str
             break
@@ -229,7 +228,6 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, sl_p
 
     result["Execution Time"] = actual_exec_time.replace('T', ' ')
 
-    # Dynamic SL & Target math based on Long/Short
     if is_short:
         sl_price = entry_price * (1 + (sl_p / 100))
         tgt_price = entry_price * (1 - (tgt_p / 100))
@@ -265,7 +263,6 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, sl_p
 
     tf_bars = round(bars_1m / (tf_minutes if tf_minutes < 1440 else 375), 1)
 
-    # Dynamic PnL calculation based on Long/Short
     if is_short:
         pnl = entry_price - exit_price
     else:
