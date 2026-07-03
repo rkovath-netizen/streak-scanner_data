@@ -12,7 +12,7 @@ import os
 # --- Page Config ---
 st.set_page_config(page_title="Upstox Trade Analyzer", page_icon="📈", layout="wide")
 st.title("📈 Upstox Swing Trade Analyzer")
-st.markdown("Consolidate trades, handle Buy/Sell strategies automatically, and track statistical hold times.")
+st.markdown("Consolidate trades, handle Buy/Sell strategies automatically, and track Option PnL.")
 
 # --- Defined Standard Inputs ---
 STRATEGIES = [
@@ -23,11 +23,7 @@ STRATEGIES = [
 ]
 
 TF_OPTIONS = {
-    "5m": 5, 
-    "15m": 15, 
-    "30m": 30, 
-    "1hr": 60, 
-    "1day": 1440 # 24 hours offset ensures it executes the next day
+    "5m": 5, "15m": 15, "30m": 30, "1hr": 60, "1day": 1440 
 }
 
 # --- Initialization of Session States ---
@@ -59,20 +55,23 @@ with st.sidebar:
     
     st.markdown("---")
     st.subheader("⏱️ Timeframe Setup")
-    tf_label = st.selectbox("Standard Timeframe", options=list(TF_OPTIONS.keys()), index=3, help="Automatically sets the Execution Offset and calculates Bars in Trade.")
+    tf_label = st.selectbox("Standard Timeframe", options=list(TF_OPTIONS.keys()), index=3)
     tf_minutes = TF_OPTIONS[tf_label]
     
     st.markdown("---")
     st.subheader("📂 Load Previous Ledger")
     ledger_upload = st.file_uploader("Upload Master Ledger (CSV)", type=["csv"])
     if ledger_upload is not None:
-        # BUG FIX: Added a button so it doesn't overwrite the master ledger on every single app rerun
         if st.button("Load Uploaded Ledger"):
             try:
                 st.session_state.master_ledger = pd.read_csv(ledger_upload)
                 st.success("Ledger loaded successfully!")
             except Exception as e:
                 st.error(f"Error loading ledger: {e}")
+
+    st.markdown("---")
+    st.subheader("🔥 Option Fetcher")
+    enable_opt_updater = st.checkbox("Enable Option Updater Tool", value=False, help="Reveals the 'Update Option Prices' button in the Master Ledger tab.")
             
     st.markdown("---")
     debug_mode = st.checkbox("🐞 Enable Debug Mode", value=False)
@@ -80,20 +79,30 @@ with st.sidebar:
 def log_debug(message):
     if debug_mode: st.session_state.debug_logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
 
-# --- Load Liquid Stocks List ---
+# --- Load F&O Details (Liquid Stocks & Lot Sizes) ---
 @st.cache_data(show_spinner=False)
-def load_liquid_stocks():
+def load_fno_details():
+    liquid_symbols = set()
+    lot_sizes = {}
     liquid_file = 'fno_with_sectors - liquid.csv'
     if os.path.exists(liquid_file):
         try:
             df = pd.read_csv(liquid_file)
             if 'Symbol' in df.columns:
-                return set(df['Symbol'].str.strip().str.upper())
+                liquid_symbols = set(df['Symbol'].str.strip().str.upper())
+            if 'Symbol' in df.columns and 'lot size' in df.columns:
+                for _, row in df.iterrows():
+                    sym = str(row['Symbol']).strip().upper()
+                    try:
+                        ls = int(float(row['lot size']))
+                        lot_sizes[sym] = ls
+                    except:
+                        pass
         except Exception as e:
             log_debug(f"Error reading liquid stocks CSV: {e}")
-    return set()
+    return liquid_symbols, lot_sizes
 
-liquid_symbols = load_liquid_stocks()
+liquid_symbols, lot_sizes = load_fno_details()
 
 # --- Helpers: Email & API ---
 def send_exit_alert(exited_trades_df, recipient, sender, password):
@@ -135,21 +144,34 @@ def robust_api_get(url, headers, max_retries=4):
     return res 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_instrument_key(symbol, token):
+def get_instrument_key(symbol, token, segment="EQ", opt_query=None):
     if not token: return None
     symbol_clean = str(symbol).strip().upper()
-    query = urllib.parse.quote(symbol_clean)
-    url = f"https://api.upstox.com/v2/instruments/search?query={query}&exchanges=NSE&segments=EQ"
+    
+    if segment == "OPT" and opt_query:
+        query = urllib.parse.quote(opt_query)
+        url = f"https://api.upstox.com/v2/instruments/search?query={query}&exchanges=NFO&segments=OPT"
+    else:
+        query = urllib.parse.quote(symbol_clean)
+        url = f"https://api.upstox.com/v2/instruments/search?query={query}&exchanges=NSE&segments=EQ"
+        
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
     res = robust_api_get(url, headers)
     
     if res.status_code == 200:
         data = res.json()
         if 'data' in data and len(data['data']) > 0:
-            for inst in data['data']:
-                if inst.get('trading_symbol', '').upper() == symbol_clean:
-                    return inst['instrument_key']
-            return data['data'][0]['instrument_key']
+            if segment == "OPT":
+                type_check = opt_query.split()[-1].upper()
+                for inst in data['data']:
+                    if type_check in inst.get('trading_symbol', '').upper():
+                        return inst['instrument_key']
+                return data['data'][0]['instrument_key']
+            else:
+                for inst in data['data']:
+                    if inst.get('trading_symbol', '').upper() == symbol_clean:
+                        return inst['instrument_key']
+                return data['data'][0]['instrument_key']
     return None
 
 def fetch_all_candles(instrument_key, from_date_str, token):
@@ -312,6 +334,8 @@ def generate_summary(df, group_column):
         mtm_pnl = group.loc[group["Status"] == "Live", "PnL (1 qty)"].sum()
         tot_pnl = group["PnL (1 qty)"].sum()
         
+        opt_pnl = group["Opt PnL"].sum() if "Opt PnL" in group.columns else 0
+        
         cum_pnl, peak, max_dd = 0, 0, 0
         for pnl in group["PnL (1 qty)"]:
             if pd.notna(pnl):
@@ -322,14 +346,17 @@ def generate_summary(df, group_column):
         max_entry = group["Entry Price"].max()
         max_dd_pct = (max_dd / max_entry * 100) if pd.notna(max_entry) and max_entry > 0 else 0
         
-        stats.append({
+        stat_dict = {
             group_column: name, "Total Trades": len(group), "Wins": wins, "Losses": losses, "Live Trades": live,
             "Win Rate %": round(winrate, 1), 
             "Avg Bars": round(mean_bars, 1) if pd.notna(mean_bars) else 0,
             "Target Exit Bars (Mean+1σ)": round(target_exit_bars, 1) if pd.notna(target_exit_bars) else 0,
-            "Booked PnL": round(booked_pnl, 2), "MTM PnL": round(mtm_pnl, 2),
-            "Total PnL": round(tot_pnl, 2), "Max DD Amount": round(max_dd, 2), "Max DD %": round(max_dd_pct, 2)
-        })
+            "Eq Booked PnL": round(booked_pnl, 2), "Eq MTM PnL": round(mtm_pnl, 2),
+            "Total Eq PnL": round(tot_pnl, 2), "Max DD Amount": round(max_dd, 2), "Max DD %": round(max_dd_pct, 2)
+        }
+        if "Opt PnL" in group.columns:
+            stat_dict["Total Opt PnL"] = round(opt_pnl, 2)
+        stats.append(stat_dict)
     return pd.DataFrame(stats)
 
 def append_to_ledger(new_df):
@@ -341,6 +368,116 @@ def append_to_ledger(new_df):
         combined.drop_duplicates(subset=dup_subset, keep='last', inplace=True)
         st.session_state.master_ledger = combined
 
+# --- Option Update Engine ---
+def update_options_in_ledger(token):
+    df = st.session_state.master_ledger.copy()
+    
+    # Safely identify columns regardless of uppercase/lowercase in Excel
+    col_strike = next((c for c in df.columns if c.lower() == 'atm strike'), None)
+    col_cepe = next((c for c in df.columns if c.lower() == 'ce/pe'), None)
+    
+    if not col_strike or not col_cepe:
+        st.warning("Columns 'atm strike' and 'CE/PE' not found in ledger. Please add them via Excel before updating.")
+        return
+
+    # Ensure output columns exist
+    for col in ['qty', 'Opt Entry', 'Opt Exit', 'Opt PnL', 'Opt PnL %']:
+        if col not in df.columns: df[col] = None
+
+    progress_bar = st.progress(0)
+    updated_count = 0
+
+    for i, row in df.iterrows():
+        strike = row.get(col_strike)
+        ce_pe = row.get(col_cepe)
+        symbol = str(row['Stock Name']).strip().upper()
+        
+        if pd.isna(strike) or pd.isna(ce_pe) or str(strike).strip() == '':
+            continue
+            
+        is_live = row.get('Status') == 'Live'
+        needs_entry = pd.isna(row.get('Opt Entry'))
+        needs_exit = pd.isna(row.get('Opt Exit')) and not is_live
+        
+        if needs_entry or is_live or needs_exit:
+            
+            # --- Auto Qty Logic ---
+            qty = row.get('qty')
+            if pd.isna(qty) or str(qty).strip() == '':
+                q = lot_sizes.get(symbol, 1) 
+            else:
+                try: q = float(qty)
+                except: q = lot_sizes.get(symbol, 1)
+            
+            df.at[i, 'qty'] = q
+            
+            try: strike_int = int(float(strike))
+            except: continue
+            ce_pe_clean = str(ce_pe).strip().upper()
+            
+            opt_query = f"{symbol} {strike_int} {ce_pe_clean}"
+            opt_key = get_instrument_key(symbol, token, segment="OPT", opt_query=opt_query)
+            
+            if opt_key:
+                # Robust Datetime Parsing for Excel compatibility
+                try:
+                    exec_dt = pd.to_datetime(row['Execution Time'])
+                    exec_date = exec_dt.strftime('%Y-%m-%d')
+                    exec_time = exec_dt.strftime('%H:%M')
+                except:
+                    log_debug(f"Failed to parse Execution Time for {symbol}: {row['Execution Time']}")
+                    continue
+                    
+                exit_time_full = row.get('Exit Time', '')
+                ex_d, ex_t = None, None
+                if pd.notna(exit_time_full) and str(exit_time_full).strip() != '':
+                    try:
+                        ex_dt_obj = pd.to_datetime(exit_time_full)
+                        ex_d = ex_dt_obj.strftime('%Y-%m-%d')
+                        ex_t = ex_dt_obj.strftime('%H:%M')
+                    except:
+                        pass
+                
+                candles, _ = fetch_all_candles(opt_key, exec_date, token)
+                if candles:
+                    opt_entry, opt_exit = None, None
+                    
+                    # Match Option Open Price with Equity Execution Time
+                    for c in candles:
+                        if c[0].split('T')[0] == exec_date and c[0].split('T')[1][:5] == exec_time:
+                            opt_entry = c[1] 
+                            break
+                    
+                    # Get Opt Exit
+                    if is_live:
+                        opt_exit = candles[-1][4] 
+                    elif ex_d and ex_t:
+                        for c in candles:
+                            if c[0].split('T')[0] == ex_d and c[0].split('T')[1][:5] == ex_t:
+                                opt_exit = c[4]
+                                break
+                                
+                    # Save to Row and Calculate PnL
+                    if opt_entry is not None: df.at[i, 'Opt Entry'] = round(opt_entry, 2)
+                    entry_val = df.at[i, 'Opt Entry'] if pd.notna(df.at[i, 'Opt Entry']) else opt_entry
+                    
+                    if opt_exit is not None: df.at[i, 'Opt Exit'] = round(opt_exit, 2)
+                    exit_val = df.at[i, 'Opt Exit'] if pd.notna(df.at[i, 'Opt Exit']) else opt_exit
+                        
+                    if entry_val is not None and exit_val is not None:
+                        pnl = (exit_val - entry_val) * q
+                        df.at[i, 'Opt PnL'] = round(pnl, 2)
+                        df.at[i, 'Opt PnL %'] = round(((exit_val - entry_val) / entry_val) * 100, 2)
+                        updated_count += 1
+            time.sleep(0.5) 
+        progress_bar.progress((i + 1) / len(df))
+        
+    st.session_state.master_ledger = df
+    if updated_count > 0:
+        st.success(f"Successfully fetched and updated option prices for {updated_count} rows!")
+    else:
+        st.info("Scan complete. No matching option rows needed updating.")
+
 def display_debug_logs():
     if debug_mode and st.session_state.debug_logs:
         with st.expander("🛠️ Debug Logs (Click to expand)", expanded=True):
@@ -351,11 +488,21 @@ tab1, tab2, tab3, tab4 = st.tabs(["📚 Master Ledger", "📝 Add Single Trade",
 
 with tab1:
     st.subheader("Your Consolidated Master Ledger")
-    st.markdown("💡 **Tip:** Click directly into the table below to manually rename strategies or delete unwanted rows. Click 'Save Edits' to update.")
     
     if st.session_state.master_ledger.empty:
         st.info("Your ledger is currently empty. Add trades using the Single Trade or Bulk CSV tabs.")
     else:
+        if enable_opt_updater:
+            st.markdown("---")
+            st.markdown("### 🔥 Options Data Updater")
+            st.markdown("Scans the ledger for manually entered `atm strike` and `CE/PE`. **Auto-fills `qty` from the liquid stocks list.** Fetches live/historical option data for missing fields or live MTM updates.")
+            if st.button("🚀 Fetch & Update Option Prices", type="primary"):
+                if not api_token: st.warning("Please enter your API Token in the sidebar.")
+                else:
+                    with st.spinner("Scanning and fetching option prices..."):
+                        update_options_in_ledger(api_token)
+            st.markdown("---")
+            
         edited_ledger = st.data_editor(st.session_state.master_ledger, use_container_width=True, num_rows="dynamic")
         col_save, col_dl, col_clear = st.columns([1, 1, 1])
         
@@ -468,10 +615,14 @@ with tab4:
             winrate = (wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
             
             c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Total Booked PnL", f"₹{total_booked_pnl:.2f}")
-            c2.metric("Total MTM PnL", f"₹{total_mtm_pnl:.2f}")
+            c1.metric("Total Eq Booked PnL", f"₹{total_booked_pnl:.2f}")
+            c2.metric("Total Eq MTM PnL", f"₹{total_mtm_pnl:.2f}")
             c3.metric("Overall Winrate", f"{winrate:.1f}%")
             c4.metric("Total Trades", total_trades)
+            
+            if "Opt PnL" in valid_res.columns:
+                total_opt_pnl = valid_res["Opt PnL"].sum()
+                st.markdown(f"**Total Options PnL (Calculated):** ₹{total_opt_pnl:.2f}")
                 
             st.markdown("---")
             
