@@ -15,15 +15,14 @@ st.set_page_config(page_title="Upstox Swing Analyzer", page_icon="📈", layout=
 st.title("📈 Upstox Swing Trade Analyzer")
 st.markdown("Consolidate trades, auto-calculate Trade Size via ATR, and run Trailing Stop Losses.")
 
-# --- Defined Standard Inputs ---
-STRATEGIES = [
+# --- Initialization of Session States ---
+DEFAULT_STRATEGIES = [
     "b_ema-x_15mt", "b_ema_x_1hr", "b_rsi_x60_15mt", "b_rsi_x_1hr", 
     "b_vwap_x_15mt", "b_vwap_x_1hr", "b_st_x_15mt", "b_st_x_1hr",
     "s_ema-x_15mt", "s_ema_x_1hr", "s_rsi_x60_15mt", "s_rsi_x_1hr", 
     "s_vwap_x_15mt", "s_vwap_x_1hr", "s_st_x_15mt", "s_st_x_1hr"
 ]
-TF_OPTIONS = {"5m": 5, "15m": 15, "30m": 30, "1hr": 60, "1day": 1440}
-
+if "strategies" not in st.session_state: st.session_state.strategies = DEFAULT_STRATEGIES.copy()
 if "master_ledger" not in st.session_state: st.session_state.master_ledger = pd.DataFrame()
 if "temp_single_trade" not in st.session_state: st.session_state.temp_single_trade = pd.DataFrame()
 if "temp_bulk_trades" not in st.session_state: st.session_state.temp_bulk_trades = pd.DataFrame()
@@ -36,22 +35,20 @@ with st.sidebar:
     api_token = st.text_input("Enter Upstox Analytics Token", value=default_token, type="password")
     
     st.markdown("---")
-    st.subheader("📧 Email Alerts")
-    enable_emails = st.checkbox("Enable Exit Alerts", value=True)
-    alert_email = st.text_input("Alert Email Address", value="9035490861r@gmail.com")
-    email_pass = st.text_input("Gmail App Password", value="oeci llhn noig moew", type="password")
-    
+    st.subheader("➕ Add Custom Strategy")
+    new_strat = st.text_input("New Strategy Name (e.g., b_custom_15mt)")
+    if st.button("Add Strategy"):
+        if new_strat and new_strat not in st.session_state.strategies:
+            st.session_state.strategies.append(new_strat)
+            st.success(f"Added {new_strat} to dropdowns!")
+            st.rerun()
+            
     st.markdown("---")
     st.markdown("**Trade Parameters (Risk & Target)**")
     max_risk = st.number_input("Max Risk per Trade (₹)", value=1000.0, step=100.0, help="Used with ATR to calculate Trade Qty.")
     atr_mult = st.number_input("ATR Trailing Multiplier", value=3.0, step=0.5, help="Distance of the trailing SL from the peak.")
     atr_period = st.number_input("ATR Period", value=14, step=1)
     tgt_pct = st.number_input("Fixed Target %", value=5.0, step=0.5, help="Leaves a fixed upside target.")
-    
-    st.markdown("---")
-    st.subheader("⏱️ Timeframe Setup")
-    tf_label = st.selectbox("Standard Timeframe", options=list(TF_OPTIONS.keys()), index=3)
-    tf_minutes = TF_OPTIONS[tf_label]
     
     st.markdown("---")
     st.subheader("📂 Load Previous Ledger")
@@ -82,6 +79,17 @@ def load_fno_details():
     return liquid_symbols
 
 liquid_symbols = load_fno_details()
+
+# --- Helpers: Timeframe Parsing ---
+def parse_tf_from_strategy(strategy_name):
+    """Dynamically detects the timeframe from the strategy batch name string."""
+    suffix = str(strategy_name).split('_')[-1].lower()
+    if '15m' in suffix: return '15m', 15
+    if '1h' in suffix or '60m' in suffix: return '1hr', 60
+    if '30m' in suffix: return '30m', 30
+    if '5m' in suffix: return '5m', 5
+    if '1d' in suffix: return '1day', 1440
+    return '1hr', 60  # Default fallback if not found
 
 # --- Helpers: API ---
 def robust_api_get(url, headers, max_retries=4):
@@ -125,7 +133,8 @@ def fetch_all_candles(instrument_key, from_date_str, token):
     return all_candles
 
 # --- Core Calculations Engine (ATR & Trailing SL) ---
-def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_p, tf_label, tf_minutes):
+def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_p):
+    tf_label, tf_minutes = parse_tf_from_strategy(strategy_name)
     symbol_clean = str(symbol).strip().upper()
     category = "Liquid" if symbol_clean in liquid_symbols else "Others"
     instrument_key = get_instrument_key(symbol_clean, token)
@@ -135,13 +144,13 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_
         "Strategy Name": strategy_name, "Stock Name": symbol_clean, "Category": category, 
         "Date": trade_date, "Timeframe": tf_label, "Trigger Time": str(trigger_time)[:5], 
         "Execution Time": None, "Entry Price": None, "Exit Price": None, 
-        "Exit Time": None, "Bars in Trade": 0, "Status": "Pending", "Qty": 0, "Total PnL (₹)": 0.0
+        "Exit Time": None, "Bars in Trade": 0, "Status": "Pending", "Qty": 0, "Total PnL (₹)": 0.0,
+        "Initial SL": None, "Current TSL": None, "Max Loss (₹)": 0.0
     }
     
     if not instrument_key:
         result["Status"] = "Error: Symbol Not Found"; return result
         
-    # Fetch extra historical data (15 days back) to warm up the 14-period ATR
     try:
         t_dt = pd.to_datetime(f"{trade_date} {str(trigger_time)[:5]}")
         exec_target_str = (t_dt + timedelta(minutes=int(tf_minutes))).strftime("%Y-%m-%dT%H:%M") 
@@ -157,7 +166,6 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_
     df = pd.DataFrame(raw_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'vol', 'oi'])
     df['datetime'] = pd.to_datetime(df['timestamp'])
     
-    # Resample to strategy timeframe to calculate true ATR
     df_resampled = df.set_index('datetime').resample(f'{tf_minutes}min').agg({
         'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'
     }).dropna()
@@ -169,10 +177,9 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_
     )
     df_resampled['atr'] = df_resampled['tr'].rolling(int(atr_period)).mean()
     
-    # Map ATR back to 1-minute data
     df['floor_dt'] = df['datetime'].dt.floor(f'{tf_minutes}min')
     df['atr'] = df['floor_dt'].map(df_resampled['atr'])
-    df['atr'] = df['atr'].ffill() # Forward fill so every minute has the current active ATR
+    df['atr'] = df['atr'].ffill() 
 
     # 2. Find Execution Entry
     entry_price, entry_idx, actual_exec_time, entry_atr = None, -1, None, None
@@ -188,13 +195,14 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_
     result["Execution Time"] = actual_exec_time.replace('T', ' ')
 
     # 3. Position Sizing
-    # If ATR is missing (not enough historical data), fallback to 1% risk to avoid division by zero
     active_atr = entry_atr if pd.notna(entry_atr) and entry_atr > 0 else (entry_price * 0.01)
     risk_per_share = atr_mult * active_atr
-    qty = max(1, int(max_risk / risk_per_share)) # Always trade at least 1 share
+    qty = max(1, int(max_risk / risk_per_share)) 
     result["Qty"] = qty
 
-    # 4. Trailing Loop Setup
+    # 4. Trailing Setup
+    initial_sl = entry_price + risk_per_share if is_short else entry_price - risk_per_share
+    current_tsl = initial_sl
     tgt_price = entry_price * (1 - (tgt_p / 100)) if is_short else entry_price * (1 + (tgt_p / 100))
     highest_peak = entry_price
     lowest_trough = entry_price
@@ -208,14 +216,13 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_
         c_time_curr = df.loc[i, 'timestamp'].split('+')[0]
         c_atr = df.loc[i, 'atr']
         
-        # Dynamically update trailing distance if ATR changes, otherwise use initial
         current_atr = c_atr if pd.notna(c_atr) and c_atr > 0 else active_atr
         
         if is_short:
             lowest_trough = min(lowest_trough, c_close)
-            trailing_sl = lowest_trough + (atr_mult * current_atr)
+            current_tsl = lowest_trough + (atr_mult * current_atr)
             
-            if c_close >= trailing_sl: 
+            if c_close >= current_tsl: 
                 exit_price, exit_time, status = c_close, c_time_curr, "Trailing SL Hit"
                 break
             elif c_close <= tgt_price: 
@@ -223,9 +230,9 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_
                 break
         else:
             highest_peak = max(highest_peak, c_close)
-            trailing_sl = highest_peak - (atr_mult * current_atr)
+            current_tsl = highest_peak - (atr_mult * current_atr)
             
-            if c_close <= trailing_sl: 
+            if c_close <= current_tsl: 
                 exit_price, exit_time, status = c_close, c_time_curr, "Trailing SL Hit"
                 break
             elif c_close >= tgt_price: 
@@ -237,13 +244,23 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_
 
     tf_bars = round(bars_1m / (tf_minutes if tf_minutes < 1440 else 375), 1)
     pnl_1_qty = (entry_price - exit_price) if is_short else (exit_price - entry_price)
+    
+    if status == "Live":
+        tsl_risk = (entry_price - current_tsl) * qty if is_short else (current_tsl - entry_price) * qty
+    else:
+        tsl_risk = pnl_1_qty * qty
 
-    result["Entry Price"] = round(entry_price, 2)
-    result["Exit Price"] = round(exit_price, 2)
-    result["Exit Time"] = exit_time.replace('T', ' ') if exit_time else None
-    result["Bars in Trade"] = tf_bars
-    result["Status"] = status
-    result["Total PnL (₹)"] = round(pnl_1_qty * qty, 2)
+    result.update({
+        "Entry Price": round(entry_price, 2),
+        "Exit Price": round(exit_price, 2),
+        "Exit Time": exit_time.replace('T', ' ') if exit_time else None,
+        "Bars in Trade": tf_bars,
+        "Status": status,
+        "Total PnL (₹)": round(pnl_1_qty * qty, 2),
+        "Initial SL": round(initial_sl, 2),
+        "Current TSL": round(current_tsl, 2),
+        "Max Loss (₹)": round(tsl_risk, 2)
+    })
     
     return result
 
@@ -305,7 +322,7 @@ with tab2:
     col_s, col_b = st.columns(2)
     with col_s:
         st.subheader("📝 Single Trade Entry")
-        s_strategy = st.selectbox("Strategy Name", options=STRATEGIES, key="single_strat")
+        s_strategy = st.selectbox("Strategy Name", options=st.session_state.strategies, key="single_strat")
         s_symbol = st.text_input("NSE Stock Name", value="RELIANCE")
         s_date = st.date_input("Trade Date")
         s_time = st.time_input("Trigger Time", value=pd.to_datetime("09:15").time())
@@ -313,7 +330,7 @@ with tab2:
             if not api_token: st.warning("Provide API Token.")
             else:
                 with st.spinner("Calculating ATR & Trade Size..."):
-                    res = calculate_trade(s_symbol, s_date, s_time, s_strategy, api_token, tgt_pct, tf_label, tf_minutes)
+                    res = calculate_trade(s_symbol, s_date, s_time, s_strategy, api_token, tgt_pct)
                     st.session_state.temp_single_trade = pd.DataFrame([res])
         if not st.session_state.temp_single_trade.empty:
             st.dataframe(st.session_state.temp_single_trade)
@@ -323,13 +340,13 @@ with tab2:
                 
     with col_b:
         st.subheader("📁 Bulk CSV Processing")
-        batch_strategy_name = st.selectbox("Assign Strategy for Batch File", options=STRATEGIES, key="bulk_strat")
+        batch_strategy_name = st.selectbox("Assign Strategy for Batch File", options=st.session_state.strategies, key="bulk_strat")
         uploaded_files = st.file_uploader("Upload Bulk Export CSV(s)", type=["csv"], accept_multiple_files=True)
         if uploaded_files:
             all_dfs = []
             for f in uploaded_files:
                 try:
-                    f.seek(0) # Reset file pointer for Streamlit
+                    f.seek(0) 
                     temp_df = pd.read_csv(f)
                     if not temp_df.empty: 
                         all_dfs.append(temp_df)
@@ -348,7 +365,7 @@ with tab2:
                         for idx, row in combined_df.iterrows():
                             time.sleep(0.2)
                             t_time = row.get('Trigger Time', row.get('time', ''))
-                            res = calculate_trade(row.get('Stock Name', ''), row.get('Date', ''), t_time, row.get('Strategy Name'), api_token, tgt_pct, tf_label, tf_minutes)
+                            res = calculate_trade(row.get('Stock Name', ''), row.get('Date', ''), t_time, row.get('Strategy Name'), api_token, tgt_pct)
                             results.append(res)
                             pb.progress((idx + 1) / len(combined_df))
                         st.session_state.temp_bulk_trades = pd.DataFrame(results)
