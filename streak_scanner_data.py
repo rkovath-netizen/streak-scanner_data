@@ -125,7 +125,7 @@ def fetch_all_candles(instrument_key, from_date_str, token):
     return all_candles
 
 # --- Core Calculations Engine (ATR & Trailing SL) ---
-def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tf_label, tf_minutes):
+def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_p, tf_label, tf_minutes):
     symbol_clean = str(symbol).strip().upper()
     category = "Liquid" if symbol_clean in liquid_symbols else "Others"
     instrument_key = get_instrument_key(symbol_clean, token)
@@ -313,7 +313,7 @@ with tab2:
             if not api_token: st.warning("Provide API Token.")
             else:
                 with st.spinner("Calculating ATR & Trade Size..."):
-                    res = calculate_trade(s_symbol, s_date, s_time, s_strategy, api_token, tf_label, tf_minutes)
+                    res = calculate_trade(s_symbol, s_date, s_time, s_strategy, api_token, tgt_pct, tf_label, tf_minutes)
                     st.session_state.temp_single_trade = pd.DataFrame([res])
         if not st.session_state.temp_single_trade.empty:
             st.dataframe(st.session_state.temp_single_trade)
@@ -336,7 +336,7 @@ with tab2:
                     for idx, row in combined_df.iterrows():
                         time.sleep(0.2)
                         t_time = row.get('Trigger Time', row.get('time', ''))
-                        res = calculate_trade(row.get('Stock Name', ''), row.get('Date', ''), t_time, row.get('Strategy Name'), api_token, tf_label, tf_minutes)
+                        res = calculate_trade(row.get('Stock Name', ''), row.get('Date', ''), t_time, row.get('Strategy Name'), api_token, tgt_pct, tf_label, tf_minutes)
                         results.append(res)
                         pb.progress((idx + 1) / len(combined_df))
                     st.session_state.temp_bulk_trades = pd.DataFrame(results)
