@@ -326,9 +326,21 @@ with tab2:
         batch_strategy_name = st.selectbox("Assign Strategy for Batch File", options=STRATEGIES, key="bulk_strat")
         uploaded_files = st.file_uploader("Upload Bulk Export CSV(s)", type=["csv"], accept_multiple_files=True)
         if uploaded_files:
-            all_dfs = [pd.read_csv(f) for f in uploaded_files]
-            combined_df = parse_uploaded_csv(pd.concat(all_dfs, ignore_index=True), batch_strategy_name)
-            if st.button("Process Batch Run"):
+            all_dfs = []
+            for f in uploaded_files:
+                try:
+                    f.seek(0) # Reset file pointer for Streamlit
+                    temp_df = pd.read_csv(f)
+                    if not temp_df.empty: 
+                        all_dfs.append(temp_df)
+                except pd.errors.EmptyDataError:
+                    pass
+                except Exception as e:
+                    st.error(f"Error reading file {f.name}: {e}")
+                    
+            if all_dfs:
+                combined_df = parse_uploaded_csv(pd.concat(all_dfs, ignore_index=True), batch_strategy_name)
+                if st.button("Process Batch Run"):
                 if not api_token: st.warning("Enter API token.")
                 else:
                     results = []
