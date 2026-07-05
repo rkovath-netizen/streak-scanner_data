@@ -341,17 +341,17 @@ with tab2:
             if all_dfs:
                 combined_df = parse_uploaded_csv(pd.concat(all_dfs, ignore_index=True), batch_strategy_name)
                 if st.button("Process Batch Run"):
-                if not api_token: st.warning("Enter API token.")
-                else:
-                    results = []
-                    pb = st.progress(0)
-                    for idx, row in combined_df.iterrows():
-                        time.sleep(0.2)
-                        t_time = row.get('Trigger Time', row.get('time', ''))
-                        res = calculate_trade(row.get('Stock Name', ''), row.get('Date', ''), t_time, row.get('Strategy Name'), api_token, tgt_pct, tf_label, tf_minutes)
-                        results.append(res)
-                        pb.progress((idx + 1) / len(combined_df))
-                    st.session_state.temp_bulk_trades = pd.DataFrame(results)
+                    if not api_token: st.warning("Enter API token.")
+                    else:
+                        results = []
+                        pb = st.progress(0)
+                        for idx, row in combined_df.iterrows():
+                            time.sleep(0.2)
+                            t_time = row.get('Trigger Time', row.get('time', ''))
+                            res = calculate_trade(row.get('Stock Name', ''), row.get('Date', ''), t_time, row.get('Strategy Name'), api_token, tgt_pct, tf_label, tf_minutes)
+                            results.append(res)
+                            pb.progress((idx + 1) / len(combined_df))
+                        st.session_state.temp_bulk_trades = pd.DataFrame(results)
             if not st.session_state.temp_bulk_trades.empty:
                 st.dataframe(st.session_state.temp_bulk_trades)
                 if st.button("Confirm Bulk Add to Ledger"):
