@@ -9,11 +9,12 @@ import os
 import gzip
 import csv
 import io
+import re
 
 # --- Page Config ---
 st.set_page_config(page_title="Upstox Swing Analyzer", page_icon="📈", layout="wide")
 st.title("📈 Upstox Swing Trade Analyzer")
-st.markdown("Consolidate trades, track TSL, Cash MTM, and sync exact Option Prices.")
+st.markdown("Consolidate trades, track TSL, Cash PnL, and sync exact Option Prices.")
 
 # --- Initialization of Session States ---
 DEFAULT_STRATEGIES = [
@@ -57,7 +58,10 @@ with st.sidebar:
     if ledger_upload is not None:
         if st.button("Load Uploaded Ledger"):
             try:
-                st.session_state.master_ledger = pd.read_csv(ledger_upload)
+                loaded_df = pd.read_csv(ledger_upload)
+                # Auto-upgrade older column names to the new format
+                loaded_df.rename(columns={'Cash MTM (₹)': 'Cash PnL (₹)', 'Opt MTM': 'Opt PnL (₹)'}, inplace=True)
+                st.session_state.master_ledger = loaded_df
                 st.success("Ledger loaded successfully!")
             except Exception as e:
                 st.error(f"Error loading ledger: {e}")
@@ -67,8 +71,6 @@ with st.sidebar:
 def load_fno_details():
     liquid_symbols = set()
     lot_sizes = {}
-    
-    # 1. Load liquid categorization
     liquid_file = 'fno_with_sectors - liquid.csv'
     if os.path.exists(liquid_file):
         try:
@@ -76,8 +78,6 @@ def load_fno_details():
             if 'Symbol' in df_liq.columns:
                 liquid_symbols = set(df_liq['Symbol'].str.strip().str.upper())
         except: pass
-        
-    # 2. Load lot sizes
     fno_file = 'fno_with_sectors.csv'
     if os.path.exists(fno_file):
         try:
@@ -88,7 +88,6 @@ def load_fno_details():
                     try: lot_sizes[sym] = int(float(row['lot size']))
                     except: pass
         except: pass
-        
     return liquid_symbols, lot_sizes
 
 liquid_symbols, lot_sizes_dict = load_fno_details()
@@ -179,6 +178,10 @@ def get_closest_expiry(symbol, trade_date_str, token):
 def resolve_contract(symbol, expiry_date_str, strike, option_type, token):
     expiry_date = datetime.strptime(expiry_date_str, "%Y-%m-%d").date()
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
+    target_strike = float(strike)
+    
+    closest_key = None
+    min_diff = float('inf')
     
     if expiry_date < datetime.today().date():
         url = "https://api.upstox.com/v2/expired-instruments/option/contract"
@@ -187,13 +190,18 @@ def resolve_contract(symbol, expiry_date_str, strike, option_type, token):
         if res and res.status_code == 200 and res.json().get("status") == "success":
             for contract in res.json().get("data", []):
                 tsym = contract.get("trading_symbol", "").upper()
-                if symbol in tsym and option_type in tsym and str(int(float(strike))) in tsym:
-                    return contract.get("instrument_key")
+                if symbol in tsym and option_type in tsym:
+                    match = re.search(r'(\d+)(CE|PE)$', tsym)
+                    if match:
+                        c_strike = float(match.group(1))
+                        diff = abs(c_strike - target_strike)
+                        if diff < min_diff:
+                            min_diff = diff
+                            closest_key = contract.get("instrument_key")
     else:
         url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
         res = requests.get(url)
         if res.status_code == 200:
-            target_strike = float(strike)
             with gzip.open(io.BytesIO(res.content), 'rt', encoding='utf-8') as f:
                 reader = csv.DictReader(f)
                 for row in reader:
@@ -201,11 +209,14 @@ def resolve_contract(symbol, expiry_date_str, strike, option_type, token):
                     if symbol in tsym and row.get('expiry') == expiry_date_str and option_type in tsym:
                         try: row_strike = float(row.get('strike', 0))
                         except: row_strike = 0.0
-                        if row_strike == target_strike:
-                            return row.get('instrument_key')
-    return None
+                        diff = abs(row_strike - target_strike)
+                        if diff < min_diff:
+                            min_diff = diff
+                            closest_key = row.get('instrument_key')
+                            
+    return closest_key
 
-def get_specific_candle(instrument_key, target_date, target_time, token):
+def get_specific_candle(instrument_key, target_date, target_time, token, return_type='open'):
     encoded_key = urllib.parse.quote(instrument_key)
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
     if instrument_key.count('|') >= 2:
@@ -216,12 +227,100 @@ def get_specific_candle(instrument_key, target_date, target_time, token):
     res = robust_api_get(url, headers)
     if res and res.status_code == 200 and res.json().get("status") == "success":
         target_ts = f"{target_date}T{target_time}"
-        for candle in res.json().get("data", {}).get("candles", []):
-            if str(candle[0]).startswith(target_ts):
-                return candle[1]
+        candles = res.json().get("data", {}).get("candles", [])
+        candles.sort(key=lambda x: x[0]) 
+        for candle in candles:
+            if str(candle[0])[:16] >= target_ts:
+                return candle[4] if return_type == 'close' else candle[1]
     return None
 
-# --- Core Calculations Engine (Cash & Options) ---
+def refresh_live_cash_metrics(row, token, atr_mult, atr_period, tgt_p):
+    strategy_name = row['Strategy Name']
+    tf_label, tf_minutes = parse_tf_from_strategy(strategy_name)
+    is_short = str(strategy_name).strip().lower().startswith('s_')
+    symbol_clean = str(row['Stock Name']).strip().upper()
+    instrument_key = get_instrument_key(symbol_clean, token)
+    
+    if not instrument_key: return row
+    exec_dt_str = str(row['Execution Time'])
+    if pd.isna(exec_dt_str) or exec_dt_str == 'None': return row
+    
+    exec_dt = pd.to_datetime(exec_dt_str)
+    hist_start_str = (exec_dt - timedelta(days=15)).strftime("%Y-%m-%d")
+    raw_candles = fetch_all_candles(instrument_key, hist_start_str, token)
+    if not raw_candles: return row
+    
+    df = pd.DataFrame(raw_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'vol', 'oi'])
+    df['datetime'] = pd.to_datetime(df['timestamp'])
+    df_resampled = df.set_index('datetime').resample(f'{tf_minutes}min').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
+    df_resampled['prev_close'] = df_resampled['close'].shift(1)
+    df_resampled['tr'] = df_resampled.apply(lambda x: max(x['high'] - x['low'], abs(x['high'] - x['prev_close']), abs(x['low'] - x['prev_close'])) if pd.notna(x['prev_close']) else x['high'] - x['low'], axis=1)
+    df_resampled['atr'] = df_resampled['tr'].rolling(int(atr_period)).mean()
+    df['floor_dt'] = df['datetime'].dt.floor(f'{tf_minutes}min')
+    df['atr'] = df['floor_dt'].map(df_resampled['atr']).ffill() 
+    
+    entry_idx = -1
+    exec_target_iso = exec_dt.strftime('%Y-%m-%dT%H:%M')
+    for i, r in df.iterrows():
+        if r['timestamp'][:16] >= exec_target_iso:
+            entry_idx = i; break
+            
+    if entry_idx == -1: return row
+    
+    entry_price = float(row['Cash Entry'])
+    initial_sl = float(row['Initial SL'])
+    qty = float(row['Qty'])
+    
+    active_atr = df.loc[entry_idx, 'atr']
+    if pd.isna(active_atr) or active_atr <= 0: active_atr = entry_price * 0.01
+        
+    current_tsl = initial_sl
+    tgt_price = entry_price * (1 - (tgt_p / 100)) if is_short else entry_price * (1 + (tgt_p / 100))
+    highest_peak = entry_price
+    lowest_trough = entry_price
+    
+    exit_price, exit_time, status, bars_1m = None, None, "Live", 0
+    cmp_price = df.iloc[-1]['close']
+    
+    for i in range(entry_idx, len(df)):
+        bars_1m += 1
+        c_close, c_time_curr, c_atr = df.loc[i, 'close'], df.loc[i, 'timestamp'].split('+')[0], df.loc[i, 'atr']
+        cmp_price = c_close 
+        current_atr = c_atr if pd.notna(c_atr) and c_atr > 0 else active_atr
+        
+        if is_short:
+            lowest_trough = min(lowest_trough, c_close)
+            current_tsl = lowest_trough + (atr_mult * current_atr)
+            if c_close >= current_tsl: exit_price, exit_time, status = c_close, c_time_curr, "Trailing SL Hit"; break
+            elif c_close <= tgt_price: exit_price, exit_time, status = c_close, c_time_curr, "Target Hit"; break
+        else:
+            highest_peak = max(highest_peak, c_close)
+            current_tsl = highest_peak - (atr_mult * current_atr)
+            if c_close <= current_tsl: exit_price, exit_time, status = c_close, c_time_curr, "Trailing SL Hit"; break
+            elif c_close >= tgt_price: exit_price, exit_time, status = c_close, c_time_curr, "Target Hit"; break
+
+    if exit_price is not None:
+        row['Cash Exit'] = round(exit_price, 2)
+        row['Exit Time'] = exit_time.replace('T', ' ')
+        cmp_price = exit_price 
+
+    row['CMP'] = round(cmp_price, 2)
+    row['Bars in Trade'] = round(bars_1m / (tf_minutes if tf_minutes < 1440 else 375), 1)
+    row['Status'] = status
+    row['Current TSL'] = round(current_tsl, 2)
+    
+    if is_short:
+        row['Cash PnL (₹)'] = round((entry_price - cmp_price) * qty, 2)
+        row['Cash PnL %'] = round(((entry_price - cmp_price) / entry_price) * 100, 2) if entry_price > 0 else 0.0
+        row['Max Loss (₹)'] = round((entry_price - current_tsl) * qty, 2)
+    else:
+        row['Cash PnL (₹)'] = round((cmp_price - entry_price) * qty, 2)
+        row['Cash PnL %'] = round(((cmp_price - entry_price) / entry_price) * 100, 2) if entry_price > 0 else 0.0
+        row['Max Loss (₹)'] = round((current_tsl - entry_price) * qty, 2)
+        
+    return row
+
+# --- Core Calculations Engine (Cash Baseline) ---
 def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_p, max_r, max_cap):
     tf_label, tf_minutes = parse_tf_from_strategy(strategy_name)
     symbol_clean = str(symbol).strip().upper()
@@ -230,10 +329,8 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_
     category = "Liquid" if symbol_clean in liquid_symbols else "Others"
     ce_pe = "PE" if is_short else "CE"
     
-    # Check lot size availability
     has_lot_size = symbol_clean in lot_sizes_dict
-    lot_size = lot_sizes_dict.get(symbol_clean, 1) # Default to 1 if not found
-    
+    lot_size = lot_sizes_dict.get(symbol_clean, 1) 
     instrument_key = get_instrument_key(symbol_clean, token)
     
     result = {
@@ -242,9 +339,9 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_
         "ATM Strike": None, "CE/PE": ce_pe, "Lot Size": lot_size, "Has Lot Size": has_lot_size,
         "Cash Entry": None, "Cash Exit": None, "CMP": None, "Qty": 0,
         "Initial SL": None, "Current TSL": None, 
-        "Cash MTM (₹)": 0.0, "Max Loss (₹)": 0.0,
+        "Cash PnL (₹)": 0.0, "Cash PnL %": 0.0, "Max Loss (₹)": 0.0,
         "Bars in Trade": 0, "Status": "Pending",
-        "Opt Entry": None, "Opt Exit": None, "Opt MTM": None
+        "Opt Entry": None, "Opt Exit": None, "Opt PnL (₹)": None, "Opt PnL %": None
     }
     
     if not instrument_key:
@@ -267,7 +364,6 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_
     df_resampled['prev_close'] = df_resampled['close'].shift(1)
     df_resampled['tr'] = df_resampled.apply(lambda x: max(x['high'] - x['low'], abs(x['high'] - x['prev_close']), abs(x['low'] - x['prev_close'])) if pd.notna(x['prev_close']) else x['high'] - x['low'], axis=1)
     df_resampled['atr'] = df_resampled['tr'].rolling(int(atr_period)).mean()
-    
     df['floor_dt'] = df['datetime'].dt.floor(f'{tf_minutes}min')
     df['atr'] = df['floor_dt'].map(df_resampled['atr']).ffill() 
 
@@ -338,21 +434,28 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_
     result["Current TSL"] = round(current_tsl, 2)
     
     if is_short:
-        result["Cash MTM (₹)"] = round((entry_price - cmp_price) * eq_qty, 2)
+        result["Cash PnL (₹)"] = round((entry_price - cmp_price) * eq_qty, 2)
+        result["Cash PnL %"] = round(((entry_price - cmp_price) / entry_price) * 100, 2) if entry_price > 0 else 0.0
         result["Max Loss (₹)"] = round((entry_price - current_tsl) * eq_qty, 2)
     else:
-        result["Cash MTM (₹)"] = round((cmp_price - entry_price) * eq_qty, 2)
+        result["Cash PnL (₹)"] = round((cmp_price - entry_price) * eq_qty, 2)
+        result["Cash PnL %"] = round(((cmp_price - entry_price) / entry_price) * 100, 2) if entry_price > 0 else 0.0
         result["Max Loss (₹)"] = round((current_tsl - entry_price) * eq_qty, 2)
         
     return result
 
-def update_options_in_ledger(token):
+def update_options_in_ledger(token, atr_mult, atr_period, tgt_p):
     df = st.session_state.master_ledger.copy()
     progress = st.progress(0)
     total_rows = len(df)
     
     for row_num, (i, row) in enumerate(df.iterrows()):
         try:
+            if str(row.get('Status')).strip().lower() == 'live' or pd.isna(row.get('Exit Time')):
+                row = refresh_live_cash_metrics(row, token, atr_mult, atr_period, tgt_p)
+                for col in row.index:
+                    df.at[i, col] = row[col]
+
             symbol = str(row.get('Stock Name')).strip().upper()
             strike = row.get('ATM Strike')
             ce_pe = row.get('CE/PE')
@@ -370,24 +473,43 @@ def update_options_in_ledger(token):
                 if expiry_str:
                     opt_key = resolve_contract(symbol, expiry_str, strike, ce_pe, token)
                     if opt_key:
+                        
                         if has_entry:
                             opt_entry = float(existing_opt_entry)
                         else:
-                            opt_entry = get_specific_candle(opt_key, trade_date, exec_time, token)
+                            opt_entry = get_specific_candle(opt_key, trade_date, exec_time, token, return_type='open')
                             if opt_entry is not None:
                                 df.at[i, 'Opt Entry'] = opt_entry
                         
                         if opt_entry is not None:
                             exit_dt_str = str(row.get('Exit Time'))
+                            opt_exit = None
+                            
                             if pd.notna(row.get('Exit Time')) and exit_dt_str != 'None':
-                                opt_exit = get_specific_candle(opt_key, exit_dt_str[:10], exit_dt_str[11:16], token)
+                                opt_exit = get_specific_candle(opt_key, exit_dt_str[:10], exit_dt_str[11:16], token, return_type='close')
                             else:
-                                now = datetime.now()
-                                opt_exit = get_specific_candle(opt_key, now.strftime("%Y-%m-%d"), now.strftime("%H:%M"), token)
+                                intra_url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(opt_key)}/1minute"
+                                intra_res = robust_api_get(intra_url, headers={'Accept': 'application/json', 'Authorization': f'Bearer {token}'})
+                                if intra_res and intra_res.status_code == 200:
+                                    intra_candles = intra_res.json().get('data', {}).get('candles', [])
+                                    if intra_candles:
+                                        opt_exit = intra_candles[0][4] 
+                                        
+                                if opt_exit is None:
+                                    now = datetime.now()
+                                    past_date = (now - timedelta(days=5)).strftime("%Y-%m-%d")
+                                    past_candles = fetch_all_candles(opt_key, past_date, token)
+                                    if past_candles:
+                                        opt_exit = past_candles[-1][4]
                                 
                             if opt_exit is not None:
                                 df.at[i, 'Opt Exit'] = opt_exit
-                                df.at[i, 'Opt MTM'] = round((opt_exit - opt_entry) * lot_size, 2)
+                                df.at[i, 'Opt PnL (₹)'] = round((opt_exit - opt_entry) * lot_size, 2)
+                                if opt_entry > 0:
+                                    df.at[i, 'Opt PnL %'] = round(((opt_exit - opt_entry) / opt_entry) * 100, 2)
+                                else:
+                                    df.at[i, 'Opt PnL %'] = 0.0
+                                    
         except Exception as e:
             st.error(f"Error updating options for row {i}: {e}")
             
@@ -395,7 +517,7 @@ def update_options_in_ledger(token):
             progress.progress((row_num + 1) / total_rows)
         
     st.session_state.master_ledger = df
-    st.success("Options Sync Complete!")
+    st.success("Ledger Sync Complete: Options & Cash Metrics Refreshed!")
 
 def parse_uploaded_csv(df, default_strategy):
     if 'seg_sym' in df.columns and 'time' in df.columns:
@@ -425,7 +547,7 @@ with tab1:
     if not st.session_state.master_ledger.empty:
         if st.button("🚀 Fetch & Update Option Prices (Uses Advanced API)", type="primary"):
             if not api_token: st.warning("Please enter your Upstox Token.")
-            else: update_options_in_ledger(api_token)
+            else: update_options_in_ledger(api_token, atr_mult, atr_period, tgt_pct)
             
     edited_ledger = st.data_editor(st.session_state.master_ledger, use_container_width=True, num_rows="dynamic")
     col_save, col_dl, col_clear = st.columns([1, 1, 1])
