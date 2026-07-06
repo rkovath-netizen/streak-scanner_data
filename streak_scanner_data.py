@@ -59,8 +59,6 @@ with st.sidebar:
         if st.button("Load Uploaded Ledger"):
             try:
                 loaded_df = pd.read_csv(ledger_upload)
-                # Auto-upgrade older column names to the new format
-                loaded_df.rename(columns={'Cash MTM (₹)': 'Cash PnL (₹)', 'Opt MTM': 'Opt PnL (₹)'}, inplace=True)
                 st.session_state.master_ledger = loaded_df
                 st.success("Ledger loaded successfully!")
             except Exception as e:
@@ -101,7 +99,28 @@ def parse_tf_from_strategy(strategy_name):
     if '1d' in suffix: return '1day', 1440
     return '1hr', 60 
 
-# --- Helpers: Advanced API from Upstox Script ---
+# --- Legacy Column Cleanup Helper ---
+def cleanup_legacy_columns(df):
+    """Automatically merges old MTM columns into new PnL columns to prevent NaNs."""
+    if 'Cash MTM (₹)' in df.columns:
+        if 'Cash PnL (₹)' in df.columns:
+            df['Cash PnL (₹)'] = df['Cash PnL (₹)'].fillna(df['Cash MTM (₹)'])
+        else:
+            df['Cash PnL (₹)'] = df['Cash MTM (₹)']
+        df.drop(columns=['Cash MTM (₹)'], inplace=True, errors='ignore')
+        
+    if 'Opt MTM' in df.columns:
+        if 'Opt PnL (₹)' in df.columns:
+            df['Opt PnL (₹)'] = df['Opt PnL (₹)'].fillna(df['Opt MTM'])
+        else:
+            df['Opt PnL (₹)'] = df['Opt MTM']
+        df.drop(columns=['Opt MTM'], inplace=True, errors='ignore')
+        
+    for col in ['Cash PnL %', 'Opt PnL %']:
+        if col not in df.columns: df[col] = 0.0
+    return df
+
+# --- Helpers: Advanced API ---
 def robust_api_get(url, headers, max_retries=4, params=None):
     for attempt in range(max_retries):
         res = requests.get(url, headers=headers, params=params)
@@ -446,6 +465,8 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_
 
 def update_options_in_ledger(token, atr_mult, atr_period, tgt_p):
     df = st.session_state.master_ledger.copy()
+    df = cleanup_legacy_columns(df)
+    
     progress = st.progress(0)
     total_rows = len(df)
     
@@ -485,9 +506,12 @@ def update_options_in_ledger(token, atr_mult, atr_period, tgt_p):
                             exit_dt_str = str(row.get('Exit Time'))
                             opt_exit = None
                             
+                            # Fetch Exit Price if closed
                             if pd.notna(row.get('Exit Time')) and exit_dt_str != 'None':
                                 opt_exit = get_specific_candle(opt_key, exit_dt_str[:10], exit_dt_str[11:16], token, return_type='close')
-                            else:
+                                
+                            # Fallback if specific exit candle was illiquid/empty OR if trade is Live
+                            if opt_exit is None:
                                 intra_url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(opt_key)}/1minute"
                                 intra_res = robust_api_get(intra_url, headers={'Accept': 'application/json', 'Authorization': f'Bearer {token}'})
                                 if intra_res and intra_res.status_code == 200:
@@ -545,6 +569,7 @@ tab1, tab2 = st.tabs(["📚 Master Ledger & Options Sync", "📝 Add Trades (Bul
 with tab1:
     st.subheader("Consolidated Ledger")
     if not st.session_state.master_ledger.empty:
+        st.session_state.master_ledger = cleanup_legacy_columns(st.session_state.master_ledger)
         if st.button("🚀 Fetch & Update Option Prices (Uses Advanced API)", type="primary"):
             if not api_token: st.warning("Please enter your Upstox Token.")
             else: update_options_in_ledger(api_token, atr_mult, atr_period, tgt_pct)
@@ -579,7 +604,7 @@ with tab2:
                         st.warning(f"⚠️ Lot size not available for {s_symbol} in fno_with_sectors.csv. Defaulted to 1.")
                         
                     df_res.drop(columns=['Has Lot Size'], inplace=True, errors='ignore')
-                    st.session_state.temp_single_trade = df_res
+                    st.session_state.temp_single_trade = cleanup_legacy_columns(df_res)
                     
         if not st.session_state.temp_single_trade.empty:
             st.dataframe(st.session_state.temp_single_trade)
@@ -623,7 +648,7 @@ with tab2:
                                 st.warning(f"⚠️ Lot size not available in fno_with_sectors.csv for: {', '.join(missing_lots)}. Defaulted to 1.")
                             df_results.drop(columns=['Has Lot Size'], inplace=True, errors='ignore')
                             
-                        st.session_state.temp_bulk_trades = df_results
+                        st.session_state.temp_bulk_trades = cleanup_legacy_columns(df_results)
                         
             if not st.session_state.temp_bulk_trades.empty:
                 st.dataframe(st.session_state.temp_bulk_trades)
