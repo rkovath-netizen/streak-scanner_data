@@ -45,6 +45,8 @@ with st.sidebar:
             
     st.markdown("---")
     st.markdown("**Trade Parameters (Risk & Target)**")
+    max_capital_eq = st.number_input("Max Capital per Trade (EQ)", value=20000.0, step=1000.0)
+    max_risk = st.number_input("Max Risk per Trade", value=1000.0, step=100.0)
     atr_mult = st.number_input("ATR Trailing Multiplier", value=3.0, step=0.5)
     atr_period = st.number_input("ATR Period", value=14, step=1)
     tgt_pct = st.number_input("Fixed Target %", value=5.0, step=0.5)
@@ -65,18 +67,28 @@ with st.sidebar:
 def load_fno_details():
     liquid_symbols = set()
     lot_sizes = {}
-    liquid_file = 'fno_with_sectors.csv'
+    
+    # 1. Load liquid categorization
+    liquid_file = 'fno_with_sectors - liquid.csv'
     if os.path.exists(liquid_file):
         try:
-            df = pd.read_csv(liquid_file)
-            if 'Symbol' in df.columns:
-                liquid_symbols = set(df['Symbol'].str.strip().str.upper())
-            if 'Symbol' in df.columns and 'lot size' in df.columns:
-                for _, row in df.iterrows():
+            df_liq = pd.read_csv(liquid_file)
+            if 'Symbol' in df_liq.columns:
+                liquid_symbols = set(df_liq['Symbol'].str.strip().str.upper())
+        except: pass
+        
+    # 2. Load lot sizes
+    fno_file = 'fno_with_sectors.csv'
+    if os.path.exists(fno_file):
+        try:
+            df_fno = pd.read_csv(fno_file)
+            if 'Symbol' in df_fno.columns and 'lot size' in df_fno.columns:
+                for _, row in df_fno.iterrows():
                     sym = str(row['Symbol']).strip().upper()
                     try: lot_sizes[sym] = int(float(row['lot size']))
                     except: pass
         except: pass
+        
     return liquid_symbols, lot_sizes
 
 liquid_symbols, lot_sizes_dict = load_fno_details()
@@ -141,7 +153,6 @@ def get_underlying_key(symbol_input):
     return mapping.get(symbol_input, f"NSE_EQ|{symbol_input}")
 
 def get_closest_expiry(symbol, trade_date_str, token):
-    """Finds the nearest valid expiry on or after the trade date."""
     available_expiries = set()
     underlying_key = get_underlying_key(symbol)
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
@@ -207,25 +218,29 @@ def get_specific_candle(instrument_key, target_date, target_time, token):
         target_ts = f"{target_date}T{target_time}"
         for candle in res.json().get("data", {}).get("candles", []):
             if str(candle[0]).startswith(target_ts):
-                return candle[1] # Return Open Price
+                return candle[1]
     return None
 
 # --- Core Calculations Engine (Cash & Options) ---
-def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_p):
+def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_p, max_r, max_cap):
     tf_label, tf_minutes = parse_tf_from_strategy(strategy_name)
     symbol_clean = str(symbol).strip().upper()
     is_short = str(strategy_name).strip().lower().startswith('s_')
     
-    # Auto Assign Base Variables
+    category = "Liquid" if symbol_clean in liquid_symbols else "Others"
     ce_pe = "PE" if is_short else "CE"
-    lot_size = lot_sizes_dict.get(symbol_clean, 1)
+    
+    # Check lot size availability
+    has_lot_size = symbol_clean in lot_sizes_dict
+    lot_size = lot_sizes_dict.get(symbol_clean, 1) # Default to 1 if not found
+    
     instrument_key = get_instrument_key(symbol_clean, token)
     
     result = {
         "Strategy Name": strategy_name, "Stock Name": symbol_clean, "Date": trade_date, 
-        "Trigger Time": str(trigger_time)[:5], "Execution Time": None, 
-        "ATM Strike": None, "CE/PE": ce_pe, "Lot Size": lot_size,
-        "Cash Entry": None, "Cash Exit": None, "CMP": None, 
+        "Category": category, "Trigger Time": str(trigger_time)[:5], "Execution Time": None, 
+        "ATM Strike": None, "CE/PE": ce_pe, "Lot Size": lot_size, "Has Lot Size": has_lot_size,
+        "Cash Entry": None, "Cash Exit": None, "CMP": None, "Qty": 0,
         "Initial SL": None, "Current TSL": None, 
         "Cash MTM (₹)": 0.0, "Max Loss (₹)": 0.0,
         "Bars in Trade": 0, "Status": "Pending",
@@ -246,7 +261,6 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_
     if not raw_candles:
         result["Status"] = "Error: No Market Data"; return result
 
-    # Calculate ATR
     df = pd.DataFrame(raw_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'vol', 'oi'])
     df['datetime'] = pd.to_datetime(df['timestamp'])
     df_resampled = df.set_index('datetime').resample(f'{tf_minutes}min').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
@@ -257,7 +271,6 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_
     df['floor_dt'] = df['datetime'].dt.floor(f'{tf_minutes}min')
     df['atr'] = df['floor_dt'].map(df_resampled['atr']).ffill() 
 
-    # Find Execution Entry
     entry_price, entry_idx, actual_exec_time, entry_atr = None, -1, None, None
     for i, row in df.iterrows():
         if row['timestamp'][:16] >= exec_target_str:
@@ -271,7 +284,15 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_
     result["Execution Time"] = actual_exec_time.replace('T', ' ')
     result["Cash Entry"] = round(entry_price, 2)
 
-    # Estimate ATM Strike dynamically based on cash price magnitude
+    active_atr = entry_atr if pd.notna(entry_atr) and entry_atr > 0 else (entry_price * 0.01)
+    risk_per_share = atr_mult * active_atr
+    
+    raw_qty_risk = int(max_r / risk_per_share) if risk_per_share > 0 else 1
+    qty_capital_limit = int(max_cap / entry_price) if entry_price > 0 else 1
+    
+    eq_qty = max(1, min(raw_qty_risk, qty_capital_limit))
+    result["Qty"] = eq_qty
+
     step = 50
     if entry_price < 250: step = 2.5
     elif entry_price < 500: step = 5
@@ -279,10 +300,6 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_
     elif entry_price < 3000: step = 20
     result["ATM Strike"] = int(round(entry_price / step) * step)
 
-    # Trailing Setup
-    active_atr = entry_atr if pd.notna(entry_atr) and entry_atr > 0 else (entry_price * 0.01)
-    risk_per_share = atr_mult * active_atr
-    
     initial_sl = entry_price + risk_per_share if is_short else entry_price - risk_per_share
     current_tsl = initial_sl
     tgt_price = entry_price * (1 - (tgt_p / 100)) if is_short else entry_price * (1 + (tgt_p / 100))
@@ -290,9 +307,8 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_
     lowest_trough = entry_price
     
     exit_price, exit_time, status, bars_1m = None, None, "Live", 0
-    cmp_price = df.iloc[-1]['close'] # Default CMP to latest close
+    cmp_price = df.iloc[-1]['close'] 
     
-    # Walk forward minute-by-minute
     for i in range(entry_idx, len(df)):
         bars_1m += 1
         c_close, c_time_curr, c_atr = df.loc[i, 'close'], df.loc[i, 'timestamp'].split('+')[0], df.loc[i, 'atr']
@@ -321,21 +337,21 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_
     result["Initial SL"] = round(initial_sl, 2)
     result["Current TSL"] = round(current_tsl, 2)
     
-    # Financial Calculations
     if is_short:
-        result["Cash MTM (₹)"] = round((entry_price - cmp_price) * lot_size, 2)
-        result["Max Loss (₹)"] = round((entry_price - current_tsl) * lot_size, 2)
+        result["Cash MTM (₹)"] = round((entry_price - cmp_price) * eq_qty, 2)
+        result["Max Loss (₹)"] = round((entry_price - current_tsl) * eq_qty, 2)
     else:
-        result["Cash MTM (₹)"] = round((cmp_price - entry_price) * lot_size, 2)
-        result["Max Loss (₹)"] = round((current_tsl - entry_price) * lot_size, 2)
+        result["Cash MTM (₹)"] = round((cmp_price - entry_price) * eq_qty, 2)
+        result["Max Loss (₹)"] = round((current_tsl - entry_price) * eq_qty, 2)
         
     return result
 
 def update_options_in_ledger(token):
     df = st.session_state.master_ledger.copy()
     progress = st.progress(0)
+    total_rows = len(df)
     
-    for i, row in df.iterrows():
+    for row_num, (i, row) in enumerate(df.iterrows()):
         try:
             symbol = str(row.get('Stock Name')).strip().upper()
             strike = row.get('ATM Strike')
@@ -343,20 +359,25 @@ def update_options_in_ledger(token):
             lot_size = float(row.get('Lot Size', 1))
             exec_dt_str = str(row.get('Execution Time'))
             
-            if pd.notna(strike) and pd.notna(ce_pe) and pd.notna(exec_dt_str):
+            existing_opt_entry = row.get('Opt Entry')
+            has_entry = pd.notna(existing_opt_entry)
+            
+            if pd.notna(strike) and pd.notna(ce_pe) and pd.notna(exec_dt_str) and exec_dt_str != 'None':
                 trade_date = exec_dt_str[:10]
                 exec_time = exec_dt_str[11:16]
                 
-                # Use Upstox robust resolution
                 expiry_str = get_closest_expiry(symbol, trade_date, token)
                 if expiry_str:
                     opt_key = resolve_contract(symbol, expiry_str, strike, ce_pe, token)
                     if opt_key:
-                        opt_entry = get_specific_candle(opt_key, trade_date, exec_time, token)
+                        if has_entry:
+                            opt_entry = float(existing_opt_entry)
+                        else:
+                            opt_entry = get_specific_candle(opt_key, trade_date, exec_time, token)
+                            if opt_entry is not None:
+                                df.at[i, 'Opt Entry'] = opt_entry
+                        
                         if opt_entry is not None:
-                            df.at[i, 'Opt Entry'] = opt_entry
-                            
-                            # Get Exit or CMP
                             exit_dt_str = str(row.get('Exit Time'))
                             if pd.notna(row.get('Exit Time')) and exit_dt_str != 'None':
                                 opt_exit = get_specific_candle(opt_key, exit_dt_str[:10], exit_dt_str[11:16], token)
@@ -369,7 +390,9 @@ def update_options_in_ledger(token):
                                 df.at[i, 'Opt MTM'] = round((opt_exit - opt_entry) * lot_size, 2)
         except Exception as e:
             st.error(f"Error updating options for row {i}: {e}")
-        progress.progress((i + 1) / len(df))
+            
+        if total_rows > 0:
+            progress.progress((row_num + 1) / total_rows)
         
     st.session_state.master_ledger = df
     st.success("Options Sync Complete!")
@@ -427,8 +450,15 @@ with tab2:
             if not api_token: st.warning("Provide API Token.")
             else:
                 with st.spinner("Calculating ATR & Constructing Profile..."):
-                    res = calculate_trade(s_symbol, s_date, s_time, s_strategy, api_token, tgt_pct)
-                    st.session_state.temp_single_trade = pd.DataFrame([res])
+                    res = calculate_trade(s_symbol, s_date, s_time, s_strategy, api_token, tgt_pct, max_risk, max_capital_eq)
+                    df_res = pd.DataFrame([res])
+                    
+                    if not df_res['Has Lot Size'].iloc[0]:
+                        st.warning(f"⚠️ Lot size not available for {s_symbol} in fno_with_sectors.csv. Defaulted to 1.")
+                        
+                    df_res.drop(columns=['Has Lot Size'], inplace=True, errors='ignore')
+                    st.session_state.temp_single_trade = df_res
+                    
         if not st.session_state.temp_single_trade.empty:
             st.dataframe(st.session_state.temp_single_trade)
             if st.button("Confirm Single Entry"):
@@ -455,13 +485,24 @@ with tab2:
                     else:
                         results = []
                         pb = st.progress(0)
-                        for idx, row in combined_df.iterrows():
+                        total_bulk_rows = len(combined_df)
+                        for row_num, (idx, row) in enumerate(combined_df.iterrows()):
                             time.sleep(0.2)
                             t_time = row.get('Trigger Time', row.get('time', ''))
-                            res = calculate_trade(row.get('Stock Name', ''), row.get('Date', ''), t_time, row.get('Strategy Name'), api_token, tgt_pct)
+                            res = calculate_trade(row.get('Stock Name', ''), row.get('Date', ''), t_time, row.get('Strategy Name'), api_token, tgt_pct, max_risk, max_capital_eq)
                             results.append(res)
-                            pb.progress((idx + 1) / len(combined_df))
-                        st.session_state.temp_bulk_trades = pd.DataFrame(results)
+                            if total_bulk_rows > 0:
+                                pb.progress((row_num + 1) / total_bulk_rows)
+                                
+                        df_results = pd.DataFrame(results)
+                        if 'Has Lot Size' in df_results.columns:
+                            missing_lots = df_results[~df_results['Has Lot Size']]['Stock Name'].unique()
+                            if len(missing_lots) > 0:
+                                st.warning(f"⚠️ Lot size not available in fno_with_sectors.csv for: {', '.join(missing_lots)}. Defaulted to 1.")
+                            df_results.drop(columns=['Has Lot Size'], inplace=True, errors='ignore')
+                            
+                        st.session_state.temp_bulk_trades = df_results
+                        
             if not st.session_state.temp_bulk_trades.empty:
                 st.dataframe(st.session_state.temp_bulk_trades)
                 if st.button("Confirm Bulk Add to Ledger"):
