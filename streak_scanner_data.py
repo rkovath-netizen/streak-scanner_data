@@ -14,7 +14,7 @@ import re
 # --- Page Config ---
 st.set_page_config(page_title="Upstox Swing Analyzer", page_icon="📈", layout="wide")
 st.title("📈 Upstox Swing Trade Analyzer")
-st.markdown("Consolidate trades, track TSL, Cash PnL, and sync exact Option Prices.")
+st.markdown("Consolidate trades, track TSL (1hr ATR adaptive), and sync Option Prices.")
 
 # --- Initialization of Session States ---
 DEFAULT_STRATEGIES = [
@@ -99,9 +99,7 @@ def parse_tf_from_strategy(strategy_name):
     if '1d' in suffix: return '1day', 1440
     return '1hr', 60 
 
-# --- Legacy Column Cleanup Helper ---
 def cleanup_legacy_columns(df):
-    """Automatically merges old MTM columns into new PnL columns to prevent NaNs."""
     if 'Cash MTM (₹)' in df.columns:
         if 'Cash PnL (₹)' in df.columns:
             df['Cash PnL (₹)'] = df['Cash PnL (₹)'].fillna(df['Cash MTM (₹)'])
@@ -161,7 +159,7 @@ def fetch_all_candles(instrument_key, from_date_str, token):
     all_candles.sort(key=lambda x: x[0])
     return all_candles
 
-# --- Options Resolution API Integration ---
+# --- Cleaned Options Resolution Engine ---
 def get_underlying_key(symbol_input):
     mapping = {
         "NIFTY": "NSE_INDEX|Nifty 50", "BANKNIFTY": "NSE_INDEX|Nifty Bank",
@@ -195,28 +193,37 @@ def get_closest_expiry(symbol, trade_date_str, token):
     return valid_dates[0] if valid_dates else None
 
 def resolve_contract(symbol, expiry_date_str, strike, option_type, token):
+    """Stripped of MCX logic. Looks for exact strike first, uses closest strike if exact fails."""
     expiry_date = datetime.strptime(expiry_date_str, "%Y-%m-%d").date()
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
     target_strike = float(strike)
     
+    exact_key = None
     closest_key = None
     min_diff = float('inf')
-    
+
+    def process_match(contract_key, tsym, c_strike=None):
+        nonlocal exact_key, closest_key, min_diff
+        if symbol in tsym and option_type in tsym:
+            if c_strike is None:
+                match = re.search(r'(\d+(\.\d+)?)(CE|PE)$', tsym)
+                if match: c_strike = float(match.group(1))
+            
+            if c_strike is not None:
+                if c_strike == target_strike:
+                    exact_key = contract_key
+                diff = abs(c_strike - target_strike)
+                if diff < min_diff:
+                    min_diff = diff
+                    closest_key = contract_key
+
     if expiry_date < datetime.today().date():
         url = "https://api.upstox.com/v2/expired-instruments/option/contract"
         params = {"instrument_key": get_underlying_key(symbol), "expiry_date": expiry_date_str}
         res = robust_api_get(url, headers, params=params)
         if res and res.status_code == 200 and res.json().get("status") == "success":
             for contract in res.json().get("data", []):
-                tsym = contract.get("trading_symbol", "").upper()
-                if symbol in tsym and option_type in tsym:
-                    match = re.search(r'(\d+)(CE|PE)$', tsym)
-                    if match:
-                        c_strike = float(match.group(1))
-                        diff = abs(c_strike - target_strike)
-                        if diff < min_diff:
-                            min_diff = diff
-                            closest_key = contract.get("instrument_key")
+                process_match(contract.get("instrument_key"), contract.get("trading_symbol", "").upper())
     else:
         url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.csv.gz"
         res = requests.get(url)
@@ -225,15 +232,12 @@ def resolve_contract(symbol, expiry_date_str, strike, option_type, token):
                 reader = csv.DictReader(f)
                 for row in reader:
                     tsym = row.get('tradingsymbol', '').upper()
-                    if symbol in tsym and row.get('expiry') == expiry_date_str and option_type in tsym:
-                        try: row_strike = float(row.get('strike', 0))
-                        except: row_strike = 0.0
-                        diff = abs(row_strike - target_strike)
-                        if diff < min_diff:
-                            min_diff = diff
-                            closest_key = row.get('instrument_key')
+                    if row.get('expiry') == expiry_date_str:
+                        try: r_strike = float(row.get('strike', 0))
+                        except: r_strike = None
+                        process_match(row.get('instrument_key'), tsym, r_strike)
                             
-    return closest_key
+    return exact_key if exact_key else closest_key
 
 def get_specific_candle(instrument_key, target_date, target_time, token, return_type='open'):
     encoded_key = urllib.parse.quote(instrument_key)
@@ -256,6 +260,10 @@ def get_specific_candle(instrument_key, target_date, target_time, token, return_
 def refresh_live_cash_metrics(row, token, atr_mult, atr_period, tgt_p):
     strategy_name = row['Strategy Name']
     tf_label, tf_minutes = parse_tf_from_strategy(strategy_name)
+    
+    # 15m Strategy Trailing Override
+    atr_tf_minutes = 60 if tf_minutes == 15 else tf_minutes
+    
     is_short = str(strategy_name).strip().lower().startswith('s_')
     symbol_clean = str(row['Stock Name']).strip().upper()
     instrument_key = get_instrument_key(symbol_clean, token)
@@ -271,12 +279,14 @@ def refresh_live_cash_metrics(row, token, atr_mult, atr_period, tgt_p):
     
     df = pd.DataFrame(raw_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'vol', 'oi'])
     df['datetime'] = pd.to_datetime(df['timestamp'])
-    df_resampled = df.set_index('datetime').resample(f'{tf_minutes}min').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
+    
+    # Calculate ATR based on overridden timeframe
+    df_resampled = df.set_index('datetime').resample(f'{atr_tf_minutes}min').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
     df_resampled['prev_close'] = df_resampled['close'].shift(1)
     df_resampled['tr'] = df_resampled.apply(lambda x: max(x['high'] - x['low'], abs(x['high'] - x['prev_close']), abs(x['low'] - x['prev_close'])) if pd.notna(x['prev_close']) else x['high'] - x['low'], axis=1)
     df_resampled['atr'] = df_resampled['tr'].rolling(int(atr_period)).mean()
-    df['floor_dt'] = df['datetime'].dt.floor(f'{tf_minutes}min')
-    df['atr'] = df['floor_dt'].map(df_resampled['atr']).ffill() 
+    df['floor_dt_atr'] = df['datetime'].dt.floor(f'{atr_tf_minutes}min')
+    df['atr'] = df['floor_dt_atr'].map(df_resampled['atr']).ffill() 
     
     entry_idx = -1
     exec_target_iso = exec_dt.strftime('%Y-%m-%dT%H:%M')
@@ -342,6 +352,10 @@ def refresh_live_cash_metrics(row, token, atr_mult, atr_period, tgt_p):
 # --- Core Calculations Engine (Cash Baseline) ---
 def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_p, max_r, max_cap):
     tf_label, tf_minutes = parse_tf_from_strategy(strategy_name)
+    
+    # 15m Strategy Trailing Override Setup
+    atr_tf_minutes = 60 if tf_minutes == 15 else tf_minutes
+    
     symbol_clean = str(symbol).strip().upper()
     is_short = str(strategy_name).strip().lower().startswith('s_')
     
@@ -379,12 +393,14 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_
 
     df = pd.DataFrame(raw_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'vol', 'oi'])
     df['datetime'] = pd.to_datetime(df['timestamp'])
-    df_resampled = df.set_index('datetime').resample(f'{tf_minutes}min').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
+    
+    # Calculate ATR using overridden timeframe
+    df_resampled = df.set_index('datetime').resample(f'{atr_tf_minutes}min').agg({'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
     df_resampled['prev_close'] = df_resampled['close'].shift(1)
     df_resampled['tr'] = df_resampled.apply(lambda x: max(x['high'] - x['low'], abs(x['high'] - x['prev_close']), abs(x['low'] - x['prev_close'])) if pd.notna(x['prev_close']) else x['high'] - x['low'], axis=1)
     df_resampled['atr'] = df_resampled['tr'].rolling(int(atr_period)).mean()
-    df['floor_dt'] = df['datetime'].dt.floor(f'{tf_minutes}min')
-    df['atr'] = df['floor_dt'].map(df_resampled['atr']).ffill() 
+    df['floor_dt_atr'] = df['datetime'].dt.floor(f'{atr_tf_minutes}min')
+    df['atr'] = df['floor_dt_atr'].map(df_resampled['atr']).ffill() 
 
     entry_price, entry_idx, actual_exec_time, entry_atr = None, -1, None, None
     for i, row in df.iterrows():
@@ -399,6 +415,7 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_
     result["Execution Time"] = actual_exec_time.replace('T', ' ')
     result["Cash Entry"] = round(entry_price, 2)
 
+    # Risk size uses 1hr ATR
     active_atr = entry_atr if pd.notna(entry_atr) and entry_atr > 0 else (entry_price * 0.01)
     risk_per_share = atr_mult * active_atr
     
@@ -424,6 +441,7 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_
     exit_price, exit_time, status, bars_1m = None, None, "Live", 0
     cmp_price = df.iloc[-1]['close'] 
     
+    # Trailing SL uses 1hr ATR
     for i in range(entry_idx, len(df)):
         bars_1m += 1
         c_close, c_time_curr, c_atr = df.loc[i, 'close'], df.loc[i, 'timestamp'].split('+')[0], df.loc[i, 'atr']
@@ -447,7 +465,7 @@ def calculate_trade(symbol, trade_date, trigger_time, strategy_name, token, tgt_
         cmp_price = exit_price 
 
     result["CMP"] = round(cmp_price, 2)
-    result["Bars in Trade"] = round(bars_1m / (tf_minutes if tf_minutes < 1440 else 375), 1)
+    result["Bars in Trade"] = round(bars_1m / (tf_minutes if tf_minutes < 1440 else 375), 1) # Display in 15m bar count still
     result["Status"] = status
     result["Initial SL"] = round(initial_sl, 2)
     result["Current TSL"] = round(current_tsl, 2)
@@ -506,11 +524,9 @@ def update_options_in_ledger(token, atr_mult, atr_period, tgt_p):
                             exit_dt_str = str(row.get('Exit Time'))
                             opt_exit = None
                             
-                            # Fetch Exit Price if closed
                             if pd.notna(row.get('Exit Time')) and exit_dt_str != 'None':
                                 opt_exit = get_specific_candle(opt_key, exit_dt_str[:10], exit_dt_str[11:16], token, return_type='close')
                                 
-                            # Fallback if specific exit candle was illiquid/empty OR if trade is Live
                             if opt_exit is None:
                                 intra_url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(opt_key)}/1minute"
                                 intra_res = robust_api_get(intra_url, headers={'Accept': 'application/json', 'Authorization': f'Bearer {token}'})
